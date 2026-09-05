@@ -1,0 +1,1256 @@
+using System.Globalization;
+using GameCurve.Excel;
+using GameCurve.Models;
+using GameCurve.Services;
+
+namespace GameCurve.Ui;
+
+public sealed class MainForm : Form
+{
+    private const int LeftPanelWidth = 165;   // 左侧功能面板宽度
+    private const int RightPanelWidth = 250;  // 可完整容纳编辑/批量/统计控件
+
+    private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
+    private readonly DataGridView _grid = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false };
+    private readonly ToolTip _tip = new() { AutoPopDelay = 12000, InitialDelay = 500, ReshowDelay = 120 };
+
+    private readonly ToolStrip _tool = new();
+    private readonly ToolStripButton _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
+    private readonly ToolStripDropDownButton _layoutButton = new("布局");
+    private readonly StatusStrip _status = new();
+    private readonly ToolStripStatusLabel _statusLabel = new() { Text = "就绪" };
+    private readonly ToolStripStatusLabel _hoverLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
+
+    // 底部工作表标签
+    private readonly FlowLayoutPanel _sheetStrip = new()
+    {
+        Dock = DockStyle.Bottom,
+        FlowDirection = FlowDirection.LeftToRight,
+        WrapContents = false,
+        AutoScroll = true,
+        Height = 46,
+        Padding = new Padding(2),
+        BackColor = Color.FromArgb(226, 230, 236)
+    };
+    private readonly List<Button> _sheetButtons = new();
+
+    // 左：列选择面板
+    private readonly CheckedListBox _colsChecked = new() { CheckOnClick = true, BorderStyle = BorderStyle.FixedSingle };
+    private readonly ComboBox _xCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+
+    // 右：编辑/批量/统计
+    private readonly Label _selInfo = new() { AutoSize = true, Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold) };
+    private readonly NumericUpDown _valUpDown = new() { DecimalPlaces = 6, Minimum = -1.0E12m, Maximum = 1.0E12m, Width = 215 };
+    private readonly NumericUpDown _stepUpDown = new() { DecimalPlaces = 6, Minimum = 1.0E-8m, Maximum = 1.0E6m, Value = 1m, Width = 215 };
+    private readonly NumericUpDown _offsetUpDown = new() { DecimalPlaces = 6, Minimum = -1.0E12m, Maximum = 1.0E12m, Width = 215 };
+    private readonly NumericUpDown _scaleUpDown = new() { DecimalPlaces = 6, Minimum = -1.0E6m, Maximum = 1.0E6m, Value = 1m, Width = 215 };
+    private readonly NumericUpDown _clampMin = new() { DecimalPlaces = 6, Minimum = -1.0E12m, Maximum = 1.0E12m, Width = 215 };
+    private readonly NumericUpDown _clampMax = new() { DecimalPlaces = 6, Minimum = -1.0E12m, Maximum = 1.0E12m, Value = 100m, Width = 215 };
+    private readonly NumericUpDown _randUpDown = new() { DecimalPlaces = 6, Minimum = 0m, Maximum = 1.0E9m, Value = 5m, Width = 215 };
+    private readonly Label _statLabel = new()
+    {
+        AutoSize = false,
+        Height = 96,
+        Font = new Font("Microsoft YaHei UI", 7.5f),
+        ForeColor = Color.FromArgb(70, 76, 84)
+    };
+
+    private SplitContainer _chartGridSplit = null!;
+    private TableLayoutPanel _chartArea = null!;
+    private readonly ContextMenuStrip _menu = new();
+    private Panel _gridPane = null!;
+    private readonly Panel _rightPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+    private readonly Panel _leftPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+
+    private WorkbookModel? _wb;
+    private SheetSnapshot? _snapshot;
+    private List<ColumnMeta> _checkedCols = new();
+    private ColumnMeta? _xColumn;
+    private ColumnMeta? _activeYColumn;
+    private readonly List<CurveSeriesView> _series = new();
+
+    private readonly Dictionary<int, (double X, double Y)> _committed = new();
+    private readonly Dictionary<int, (double X, double Y)> _editing = new();
+    private readonly Dictionary<int, int> _rowToGridIndex = new();
+    private readonly HashSet<(int Col, int Row)> _dirtyCells = new();
+    private readonly HashSet<int> _pendingUndoRows = new();
+
+    private bool _gridAtRight;
+    private bool _suppressRebuild;
+    private bool _syncFromGrid;
+    private string _activeSheet = "";
+    private string _autoFocusSheet = "";
+    private int _autoFocusCol = -1;
+
+    private readonly System.Windows.Forms.Timer _autoSaveTimer = new() { Interval = 600 };
+    private readonly System.Windows.Forms.Timer _reloadTimer = new() { Interval = 600 };
+    private FileSystemWatcher? _watcher;
+    private bool _selfWrite;
+
+    private readonly string? _startupFile;
+    private readonly string _settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GameCurve", "layout.json");
+    private LayoutSettings _settings = new();
+    private sealed record EditCmd(List<(int Col, int Row, string Old, string New)> Cells);
+    private readonly List<EditCmd> _undo = new();
+    private readonly List<EditCmd> _redo = new();
+
+    public MainForm(string? startupFile = null)
+    {
+        _startupFile = startupFile;
+        LoadSettings();
+        Text = "GameCurve - 游戏数据曲线编辑器";
+        Width = 1440; Height = 920;
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new Size(1150, 720);
+        Font = new Font("Microsoft YaHei UI", 9f);
+
+        BuildUi();
+        BuildEvents();
+        Shown += (s, e) => OnShown();
+    }
+
+    private sealed class LayoutSettings
+    {
+        public int LeftWidth { get; set; } = LeftPanelWidth;
+        public int RightWidth { get; set; } = RightPanelWidth;
+        public int SplitterDistance { get; set; } = -1;
+        public bool GridAtRight { get; set; }
+        public bool Maximized { get; set; } = true;
+        public string LastFile { get; set; } = "";
+    }
+
+    private void LoadSettings()
+    {
+        try
+        {
+            if (File.Exists(_settingsPath))
+                _settings = System.Text.Json.JsonSerializer.Deserialize<LayoutSettings>(File.ReadAllText(_settingsPath)) ?? new LayoutSettings();
+        }
+        catch { _settings = new LayoutSettings(); }
+    }
+
+    private void SaveSettings()
+    {
+        _settings.LeftWidth = (int)_chartArea.ColumnStyles[0].Width;
+        _settings.RightWidth = (int)_chartArea.ColumnStyles[2].Width;
+        _settings.GridAtRight = _gridAtRight;
+        _settings.Maximized = WindowState == FormWindowState.Maximized;
+        _settings.SplitterDistance = _chartGridSplit.Height > 0 ? _chartGridSplit.SplitterDistance : -1;
+        _settings.LastFile = _wb?.Path ?? _settings.LastFile;
+        try
+        {
+            var dir = Path.GetDirectoryName(_settingsPath)!;
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(_settingsPath, System.Text.Json.JsonSerializer.Serialize(_settings));
+        }
+        catch { }
+    }
+
+    private void BuildUi()
+    {
+        _tool.GripStyle = ToolStripGripStyle.Hidden;
+        AddButton("打开", "选择并打开 .xlsx/.xlsm 工作簿", OnOpen);
+        AddButton("保存", "把当前改动写回 Excel 文件", OnSave);
+        AddButton("另存为", "复制一份并另存为新文件", OnSaveAs);
+        AddButton("刷新", "重新从磁盘读取当前工作表", OnReload);
+        _tool.Items.Add(new ToolStripSeparator());
+        AddButton("撤销", "撤销上次编辑（Ctrl+Z）", () => Undo());
+        AddButton("重做", "重做上次撤销（Ctrl+Y）", () => Redo());
+        _tool.Items.Add(new ToolStripSeparator());
+        AddButton("导出PNG", "把当前曲线图导出为 PNG 图片", OnExport);
+        _autoSaveCheck.ToolTipText = "勾选后拖动点/按键调整会自动写回 Excel；默认关闭，需手动点“保存”";
+        _tool.Items.Add(_autoSaveCheck);
+        _layoutButton.ToolTipText = "切换表格与曲线区的布局：底部 或 右侧并列";
+        _layoutButton.DropDownItems.Add(MakeMenu("表格置底", "表格放在曲线区下方", () => SetGridSide(false), true));
+        _layoutButton.DropDownItems.Add(MakeMenu("表格靠右", "表格与曲线区左右并列", () => SetGridSide(true), false));
+        _tool.Items.Add(_layoutButton);
+        _tool.Dock = DockStyle.Top;
+        Controls.Add(_tool);
+
+        // 左：列选择
+        int lw = LeftPanelWidth - 16;
+        int rw = RightPanelWidth - 16;
+        int ly = 30;
+        void L(Control c, int h = 0)
+        {
+            if (c.AutoSize)
+            {
+                c.Location = new Point(8, ly);
+                c.Width = lw;
+                _leftPanel.Controls.Add(c);
+                ly += Math.Max(22, c.GetPreferredSize(Size.Empty).Height) + 6;
+            }
+            else
+            {
+                int hh = h == 0 ? (c.Height > 0 ? c.Height : 26) : h;
+                c.SetBounds(8, ly, lw, hh);
+                _leftPanel.Controls.Add(c);
+                ly += hh + 6;
+            }
+        }
+        L(Section("曲线列 (Y) 多选"));
+        L(_colsChecked, 190);
+        ly += 8;
+        L(Section("X 轴"));
+        L(_xCombo, 26);
+        L(MakeHint("行号 或 选某数值列作为 X（此时可拖动横移该列）"));
+
+        // 右：编辑/批量/统计（功能面板，始终在最右侧）
+        int ry = 30;
+        void R(Control c, int h = 0)
+        {
+            if (c.AutoSize)
+            {
+                c.Location = new Point(8, ry);
+                c.Width = rw;
+                _rightPanel.Controls.Add(c);
+                ry += Math.Max(22, c.GetPreferredSize(Size.Empty).Height) + 6;
+            }
+            else
+            {
+                int hh = h == 0 ? (c.Height > 0 ? c.Height : 26) : h;
+                c.SetBounds(8, ry, rw, hh);
+                _rightPanel.Controls.Add(c);
+                ry += hh + 6;
+            }
+        }
+        R(_selInfo, 24);
+        R(MakeLabel("选中点数值:"), 20);
+        R(_valUpDown, 28);
+        R(MakeButton("应用值", OnApplyValue), 30);
+        R(MakeLabel("键盘微调步长:"), 20);
+        R(_stepUpDown, 28);
+        ry += 10;
+        R(Section("批量操作"));
+        R(MakeLabel("偏移 (+/-):"), 20);
+        R(_offsetUpDown, 28);
+        R(MakeButton("偏移 Δ", () => BatchOffset((double)_offsetUpDown.Value)), 30);
+        R(MakeLabel("缩放 (×):"), 20);
+        R(_scaleUpDown, 28);
+        R(MakeButton("缩放 ×", () => BatchScale((double)_scaleUpDown.Value)), 30);
+        R(MakeLabel("钳制 最小 / 最大:"), 20);
+        R(_clampMin, 28);
+        R(_clampMax, 28);
+        R(MakeButton("钳制", () => BatchClamp((double)_clampMin.Value, (double)_clampMax.Value)), 30);
+        R(MakeButton("整列平滑", BatchSmooth), 30);
+        R(MakeButton("整列归一化", BatchNormalize), 30);
+        R(MakeLabel("随机扰动幅度:"), 20);
+        R(_randUpDown, 28);
+        R(MakeButton("随机扰动", () => BatchRandom((double)_randUpDown.Value)), 30);
+        R(MakeButton("右键更多操作", OpenContextAtChart), 30);
+        ry += 10;
+        R(Section("统计"));
+        R(_statLabel, 132);
+
+        // 顶部三栏：左侧选择 | 曲线 | 右侧功能面板（功能面板只在这一栏，不遮挡下方表格）
+        int leftCol = Math.Clamp(_settings.LeftWidth, LeftPanelWidth, 460);
+        int rightCol = Math.Clamp(_settings.RightWidth, RightPanelWidth, 460);
+        _chartArea = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
+        _chartArea.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, leftCol));
+        _chartArea.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        _chartArea.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, rightCol));
+        _chartArea.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        _chartArea.Controls.Add(_leftPanel, 0, 0);
+        _chartArea.Controls.Add(_curve, 1, 0);
+        _chartArea.Controls.Add(_rightPanel, 2, 0);
+
+        // 数据表格 + 底部工作表标签（作为一个整体，独占下方整行）
+        _gridPane = new Panel { Dock = DockStyle.Fill };
+        _gridPane.Controls.Add(_grid);
+        _gridPane.Controls.Add(_sheetStrip);
+
+        // 顶部（功能面板区域） 与 表格 之间可拖动分隔，表格可置底/置右
+        _chartGridSplit = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            Panel1MinSize = 120,
+            Panel2MinSize = 120,
+            SplitterWidth = 6
+        };
+        _chartGridSplit.Panel1.Controls.Add(_chartArea);
+        _chartGridSplit.Panel2.Controls.Add(_gridPane);
+        Controls.Add(_chartGridSplit);
+
+        // 状态栏（最底部）
+        _status.Items.Add(_statusLabel);
+        _status.Items.Add(_hoverLabel);
+        _status.Dock = DockStyle.Bottom;
+        Controls.Add(_status);
+
+        _grid.AllowUserToResizeRows = true;
+        _grid.RowHeadersVisible = true;
+        _grid.EditMode = DataGridViewEditMode.EditOnEnter;
+        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.DisplayedCells;
+        _grid.BackgroundColor = Color.White;
+
+        _menu.ShowImageMargin = false;
+        _curve.ContextMenuStrip = _menu;
+
+        BuildTooltips();
+    }
+
+    private void BuildEvents()
+    {
+        _colsChecked.ItemCheck += (s, e) => BeginInvoke((Action)OnSelectionChanged);
+        _xCombo.SelectedIndexChanged += (s, e) => OnSelectionChangedSafe();
+        _stepUpDown.ValueChanged += (s, e) => _curve.KeyboardStep = (double)_stepUpDown.Value;
+
+        _curve.PointsChanged += OnPointsChanged;
+        _curve.EditCommitted += OnEditCommitted;
+        _curve.SelectionChanged += OnSelectionChangedUi;
+        _curve.HoverChanged += s => _hoverLabel.Text = s;
+        _grid.CellEndEdit += OnGridCellEdited;
+        _grid.CellClick += OnGridCellClicked;
+        _menu.Opening += (s, e) => BuildContextMenu();
+
+        _autoSaveTimer.Tick += (s, e) => { _autoSaveTimer.Stop(); CommitPending(); };
+        _reloadTimer.Tick += (s, e) => { _reloadTimer.Stop(); ReloadFromDisk(); };
+
+        KeyPreview = true;
+        KeyDown += (s, e) =>
+        {
+            if (e.Control && e.KeyCode == Keys.Z) { Undo(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.Y) { Redo(); e.Handled = true; }
+        };
+    }
+
+    // ---------- 打开 / 工作表 ----------
+    private void OnShown()
+    {
+        WindowState = _settings.Maximized ? FormWindowState.Maximized : FormWindowState.Normal;
+        _chartArea.ColumnStyles[0].Width = Math.Clamp(_settings.LeftWidth, LeftPanelWidth, 460);
+        _chartArea.ColumnStyles[2].Width = Math.Clamp(_settings.RightWidth, RightPanelWidth, 460);
+        SetGridSide(_settings.GridAtRight);
+        int min = Math.Max(_chartGridSplit.Panel1MinSize, 120);
+        int max = Math.Max(min, (int)((_settings.GridAtRight ? _chartGridSplit.Width : _chartGridSplit.Height)) - Math.Max(_chartGridSplit.Panel2MinSize, 120));
+        int dist = _settings.SplitterDistance > 0
+            ? Math.Max(min, Math.Min(_settings.SplitterDistance, max))
+            : Math.Max(min, (int)((_settings.GridAtRight ? _chartGridSplit.Width : _chartGridSplit.Height) * 0.58));
+        try { _chartGridSplit.SplitterDistance = dist; } catch { }
+        if (File.Exists(_startupFile)) OpenFile(_startupFile!);
+        else if (File.Exists(_settings.LastFile)) OpenFile(_settings.LastFile!);
+    }
+
+    private void OnOpen()
+    {
+        using var ofd = new OpenFileDialog
+        {
+            Title = "选择游戏数据工作簿",
+            Filter = "Excel 工作簿 (*.xlsx;*.xlsm)|*.xlsx;*.xlsm|所有文件 (*.*)|*.*"
+        };
+        if (ofd.ShowDialog(this) != DialogResult.OK) return;
+        OpenFile(ofd.FileName);
+    }
+
+    private void OpenFile(string path)
+    {
+        _wb?.Dispose();
+        _wb = new WorkbookModel();
+        try { _wb.Open(path); }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "无法打开文件：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        SetupWatcher(path);
+        BuildSheetStrip();
+        var best = FindBestDataColumn();
+        var target = best?.Sheet ?? (_wb.SheetNames.Count > 0 ? _wb.SheetNames[0] : "");
+        _autoFocusSheet = best?.Sheet ?? "";
+        _autoFocusCol = best?.Col.ColumnIndex ?? -1;
+        ActivateSheet(target);
+        UpdateTitle();
+    }
+
+    private (string Sheet, ColumnMeta Col)? FindBestDataColumn()
+    {
+        if (_wb == null) return null;
+        (string Sheet, ColumnMeta Col, int Count)? best = null;
+        foreach (var sheet in _wb.SheetNames)
+        {
+            SheetSnapshot sn;
+            try { sn = _wb.LoadSheet(sheet); } catch { continue; }
+            foreach (var col in sn.Columns.Where(c => c.IsNumericScalar))
+            {
+                if (col.Name.Equals("ID", StringComparison.OrdinalIgnoreCase) || col.Name.Contains("序号")) continue;
+                int cnt = sn.GetNumericColumn(col.ColumnIndex).Count;
+                if (best == null || cnt > best.Value.Count) best = (sheet, col, cnt);
+            }
+        }
+        return best == null ? null : (best.Value.Sheet, best.Value.Col);
+    }
+
+    private void BuildSheetStrip()
+    {
+        _sheetStrip.SuspendLayout();
+        _sheetStrip.Controls.Clear();
+        _sheetButtons.Clear();
+        if (_wb == null) { _sheetStrip.ResumeLayout(); return; }
+        foreach (var name in _wb.SheetNames)
+        {
+            var b = new Button
+            {
+                Text = name,
+                Tag = name,
+                AutoSize = true,
+                FlatStyle = FlatStyle.Flat,
+                Height = 26,
+                Margin = new Padding(1, 2, 1, 2),
+                Cursor = Cursors.Hand,
+                BackColor = Color.FromArgb(214, 220, 228),
+                ForeColor = Color.FromArgb(50, 56, 64)
+            };
+            b.FlatAppearance.BorderSize = 0;
+            b.Click += (s, e) => ActivateSheet(((Button)s!).Tag!.ToString()!);
+            _sheetStrip.Controls.Add(b);
+            _sheetButtons.Add(b);
+        }
+        _sheetStrip.ResumeLayout();
+        HighlightActiveSheet();
+    }
+
+    private void HighlightActiveSheet()
+    {
+        foreach (var b in _sheetButtons)
+        {
+            bool active = (string)b.Tag! == _activeSheet;
+            b.BackColor = active ? Color.FromArgb(49, 110, 244) : Color.FromArgb(214, 220, 228);
+            b.ForeColor = active ? Color.White : Color.FromArgb(50, 56, 64);
+            b.FlatAppearance.BorderSize = active ? 0 : 0;
+            _tip.SetToolTip(b, "切换到此工作表");
+        }
+    }
+
+    private void ActivateSheet(string name)
+    {
+        if (_wb == null || name == "" ) return;
+        if (_activeSheet != name && HasUnsavedChanges())
+        {
+            var r = MessageBox.Show(this, "切换工作表前是否保存当前改动？", "确认",
+                MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel) return;
+            if (r == DialogResult.Yes) CommitPending();
+            else DiscardUnsaved();
+        }
+        _activeSheet = name;
+        _autoFocusCol = name == _autoFocusSheet ? _autoFocusCol : -1;
+        HighlightActiveSheet();
+        LoadSheetAndColumns();
+    }
+
+    private bool HasUnsavedChanges() => _dirtyCells.Count > 0;
+
+    private void DiscardUnsaved()
+    {
+        _dirtyCells.Clear();
+        _pendingUndoRows.Clear();
+        _editing.Clear();
+        _committed.Clear();
+        _undo.Clear();
+        _redo.Clear();
+        UpdateTitle();
+    }
+
+    private void LoadSheetAndColumns()
+    {
+        if (_wb == null || string.IsNullOrEmpty(_activeSheet)) return;
+        try { _snapshot = _wb.LoadSheet(_activeSheet); }
+        catch (Exception ex) { _statusLabel.Text = "读取工作表失败：" + ex.Message; return; }
+
+        var nums = _snapshot.Columns.Where(c => c.IsNumericScalar).ToList();
+        _colsChecked.Items.Clear();
+        foreach (var c in nums) _colsChecked.Items.Add(c);
+        if (nums.Count > 0)
+        {
+            int focus = _autoFocusCol >= 0 ? nums.FindIndex(c => c.ColumnIndex == _autoFocusCol) : 0;
+            if (focus < 0) focus = 0;
+            for (int i = 0; i < nums.Count; i++) _colsChecked.SetItemChecked(i, i == focus);
+        }
+        _autoFocusCol = -1;
+
+        _xCombo.Items.Clear();
+        _xCombo.Items.Add("行号");
+        foreach (var c in nums) _xCombo.Items.Add(c);
+        _xCombo.SelectedIndex = 0;
+
+        RebuildFromSelection();
+        _statusLabel.Text = $"已加载 [{_activeSheet}]：{_snapshot.DataRowCount} 行 × {_snapshot.ColumnCount} 列，数值列 {nums.Count} 个";
+    }
+
+    private void RebuildFromSelection()
+    {
+        if (_wb == null || _snapshot == null) return;
+        _suppressRebuild = true;
+        try
+        {
+            _checkedCols = _colsChecked.CheckedItems.Cast<ColumnMeta>().ToList();
+            if (_checkedCols.Count == 0)
+            {
+                _series.Clear();
+                _curve.SetSeries(new List<CurveSeriesView>(), -1);
+                _activeYColumn = null;
+                BuildGrid();
+                UpdateStats();
+                return;
+            }
+            _xColumn = _xCombo.SelectedIndex > 0 ? _xCombo.SelectedItem as ColumnMeta : null;
+            _activeYColumn = _checkedCols[0];
+
+            _series.Clear();
+            for (int i = 0; i < _checkedCols.Count; i++)
+                _series.Add(BuildSeriesForColumn(_checkedCols[i], i == 0));
+
+            _curve.SetSeries(_series, 0);
+            _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
+            _curve.YAxisLabel = _activeYColumn.DisplayName;
+
+            _committed.Clear(); _editing.Clear();
+            _pendingUndoRows.Clear();
+            _undo.Clear(); _redo.Clear();
+            foreach (var p in _curve.Points)
+            {
+                _committed[p.RowNumber] = (p.X, p.Y);
+                _editing[p.RowNumber] = (p.X, p.Y);
+            }
+            BuildGrid();
+            UpdateStats();
+            UpdateTitle();
+            _curve.ClearSelection();
+        }
+        finally { _suppressRebuild = false; }
+    }
+
+    private CurveSeriesView BuildSeriesForColumn(ColumnMeta col, bool editable)
+    {
+        var points = new List<CurvePoint>();
+        foreach (var (row, val) in _snapshot!.GetNumericColumn(col.ColumnIndex))
+        {
+            double x = row; bool xEditable = false;
+            if (_xColumn != null)
+            {
+                int gi = _snapshot.RowNumbers.IndexOf(row);
+                if (gi >= 0 && _xColumn.ColumnIndex < _snapshot.Grid[gi].Length &&
+                    CellHelper.TryParseDouble(_snapshot.Grid[gi][_xColumn.ColumnIndex], out var xv))
+                { x = xv; xEditable = true; }
+                else continue;
+            }
+            points.Add(new CurvePoint(x, val, row, xEditable));
+        }
+        var view = new CurveSeriesView
+        {
+            Name = col.DisplayName,
+            Color = CurveEditor.Palette[_series.Count % CurveEditor.Palette.Length],
+            IsEditable = editable
+        };
+        view.Points.AddRange(points);
+        return view;
+    }
+
+    private void OnSelectionChanged() => OnSelectionChangedSafe();
+    private void OnSelectionChangedSafe()
+    {
+        if (_suppressRebuild || _wb == null) return;
+        CommitPending();
+        RebuildFromSelection();
+    }
+
+    private void SetActiveSeries(int seriesIndex)
+    {
+        if (seriesIndex < 0 || seriesIndex >= _checkedCols.Count) return;
+        CommitPending();
+        _activeYColumn = _checkedCols[seriesIndex];
+        _curve.SetActiveSeries(seriesIndex);
+        _curve.YAxisLabel = _activeYColumn.DisplayName;
+        _committed.Clear(); _editing.Clear();
+        _pendingUndoRows.Clear();
+        foreach (var p in _curve.Points)
+        {
+            _committed[p.RowNumber] = (p.X, p.Y);
+            _editing[p.RowNumber] = (p.X, p.Y);
+        }
+        HighlightEditableColumn();
+        UpdateStats();
+    }
+
+    private void HighlightEditableColumn()
+    {
+        int activeCol = _activeYColumn?.ColumnIndex ?? -1;
+        for (int i = 0; i < _grid.Columns.Count; i++)
+        {
+            var col = _grid.Columns[i];
+            if (i == 0) continue; // 行号列
+            col.DefaultCellStyle.BackColor = (i - 1 == activeCol) ? Color.FromArgb(255, 250, 235) : Color.White;
+        }
+        _grid.Refresh();
+    }
+
+    // ---------- 同步 ----------
+    private void OnPointsChanged(IReadOnlyList<int> rows)
+    {
+        if (rows.Count == 0) return;
+        foreach (var row in rows)
+        {
+            if (!TryGetPoint(row, out var p)) continue;
+            _editing[row] = (p.X, p.Y);
+            if (_activeYColumn != null)
+            {
+                _dirtyCells.Add((_activeYColumn.ColumnIndex, row));
+                UpdateSnapshotCell(row, _activeYColumn.ColumnIndex, FormatCellValue(p.Y, _activeYColumn.IsInteger));
+            }
+            if (_xColumn != null && p.XEditable)
+            {
+                _dirtyCells.Add((_xColumn.ColumnIndex, row));
+                UpdateSnapshotCell(row, _xColumn.ColumnIndex, FormatCellValue(p.X, _xColumn.IsInteger));
+            }
+            _pendingUndoRows.Add(row);
+        }
+        UpdateGridCells(rows);
+        UpdateStats();
+        UpdateTitle();
+    }
+
+    private void OnEditCommitted()
+    {
+        RecordDragUndo(_pendingUndoRows.ToList());
+        _pendingUndoRows.Clear();
+        if (_autoSaveCheck.Checked) { _autoSaveTimer.Stop(); _autoSaveTimer.Start(); }
+    }
+
+    private void RecordDragUndo(IReadOnlyList<int> rows)
+    {
+        if (rows.Count == 0) return;
+        var items = new List<(int, int, string, string)>();
+        foreach (var row in rows)
+        {
+            if (!_editing.TryGetValue(row, out var cur)) continue;
+            var old = _committed.TryGetValue(row, out var o) ? o : cur;
+            if (Math.Abs(old.X - cur.X) < 1e-12 && Math.Abs(old.Y - cur.Y) < 1e-12) continue;
+            if (_activeYColumn != null)
+                items.Add((_activeYColumn.ColumnIndex, row, FormatCellValue(old.Y, _activeYColumn.IsInteger), FormatCellValue(cur.Y, _activeYColumn.IsInteger)));
+            if (_xColumn != null && TryGetPoint(row, out var p) && p.XEditable && Math.Abs(old.X - cur.X) > 1e-12)
+                items.Add((_xColumn.ColumnIndex, row, FormatCellValue(old.X, _xColumn.IsInteger), FormatCellValue(cur.X, _xColumn.IsInteger)));
+            _committed[row] = cur;
+        }
+        if (items.Count > 0) { _undo.Add(new EditCmd(items)); _redo.Clear(); }
+    }
+
+    private bool TryGetPoint(int row, out CurvePoint p)
+    {
+        foreach (var pp in _curve.Points)
+            if (pp.RowNumber == row) { p = pp; return true; }
+        p = null!;
+        return false;
+    }
+
+    private void CommitPending()
+    {
+        if (_wb == null || _dirtyCells.Count == 0) return;
+        _autoSaveTimer.Stop();
+        var nums = new List<CellWrite>();
+        var strs = new List<CellWriteString>();
+        foreach (var (col, row) in _dirtyCells)
+        {
+            if (col < 0 || col >= _snapshot!.Columns.Count) continue;
+            var meta = _snapshot.Columns[col];
+            string text = CellText(col, row);
+            string cellRef = CellHelper.ToCellReference(col, row);
+            if (meta.IsNumericScalar && CellHelper.TryParseDouble(text, out var v))
+                nums.Add(new CellWrite(_snapshot.SheetName, cellRef, v, meta.IsInteger, 6));
+            else
+                strs.Add(new CellWriteString(_snapshot.SheetName, cellRef, text));
+        }
+        _selfWrite = true;
+        bool ok = _wb.TryWriteCells(nums, out var errNum);
+        bool okStr = _wb.TryWriteCellsString(strs, out var errStr);
+        _selfWrite = false;
+        if (!ok) _statusLabel.Text = "⚠ " + errNum;
+        else if (!okStr) _statusLabel.Text = "⚠ " + errStr;
+        else
+        {
+            _statusLabel.Text = $"已保存 {nums.Count + strs.Count} 个单元格";
+            _dirtyCells.Clear();
+        }
+        UpdateTitle();
+    }
+
+    private string CellText(int col, int row)
+    {
+        if (_snapshot != null && _rowToGridIndex.TryGetValue(row, out var gi) &&
+            gi >= 0 && gi < _snapshot.Grid.Count && col >= 0 && col < _snapshot.Grid[gi].Length)
+            return _snapshot.Grid[gi][col] ?? "";
+        return "";
+    }
+
+    private double SnapshotValue(int row, int colIndex, double fallback)
+    {
+        if (_snapshot != null && _rowToGridIndex.TryGetValue(row, out var gi) &&
+            gi >= 0 && gi < _snapshot.Grid.Count && colIndex >= 0 && colIndex < _snapshot.Grid[gi].Length)
+            return CellHelper.TryParseDouble(_snapshot.Grid[gi][colIndex], out var v) ? v : fallback;
+        return fallback;
+    }
+
+    private void UpdateSnapshotCell(int rowNumber, int colIndex, string value)
+    {
+        if (_snapshot == null) return;
+        if (_rowToGridIndex.TryGetValue(rowNumber, out var gi) &&
+            gi >= 0 && gi < _snapshot.Grid.Count && colIndex >= 0 && colIndex < _snapshot.Grid[gi].Length)
+            _snapshot.Grid[gi][colIndex] = value;
+    }
+
+    private static string FormatCellValue(double v, bool integer)
+    {
+        if (integer) return ((long)Math.Round(v)).ToString(CultureInfo.InvariantCulture);
+        return v.ToString("0.######", CultureInfo.InvariantCulture);
+    }
+
+    // ---------- 网格 ----------
+    private void BuildGrid()
+    {
+        _grid.Columns.Clear();
+        if (_snapshot == null) { _grid.Rows.Clear(); return; }
+        var header = new DataGridViewTextBoxColumn { HeaderText = "行号", Name = "行号", ReadOnly = true, Width = 60 };
+        _grid.Columns.Add(header);
+        foreach (var col in _snapshot.Columns)
+        {
+            var c = new DataGridViewTextBoxColumn
+            {
+                HeaderText = col.DisplayName,
+                Name = "col" + col.ColumnIndex,
+                ReadOnly = false,
+                SortMode = DataGridViewColumnSortMode.NotSortable
+            };
+            if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.ColumnIndex)
+                c.DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 235);
+            _grid.Columns.Add(c);
+        }
+
+        _grid.Rows.Clear();
+        _rowToGridIndex.Clear();
+        for (int gi = 0; gi < _snapshot.RowNumbers.Count; gi++)
+        {
+            var cells = new object[_snapshot.ColumnCount + 1];
+            int rowNum = _snapshot.RowNumbers[gi];
+            cells[0] = rowNum;
+            _rowToGridIndex[rowNum] = gi;
+            var row = _snapshot.Grid[gi];
+            for (int c = 0; c < _snapshot.ColumnCount; c++)
+                cells[c + 1] = c < row.Length ? (row[c] ?? "") : "";
+            _grid.Rows.Add(cells);
+        }
+        _grid.ClearSelection();
+    }
+
+    private void UpdateGridCells(IReadOnlyList<int> rows)
+    {
+        if (_snapshot == null || _activeYColumn == null) return;
+        int yGridCol = _activeYColumn.ColumnIndex + 1;
+        foreach (var row in rows)
+        {
+            if (!_rowToGridIndex.TryGetValue(row, out var gi) || gi >= _snapshot.Grid.Count) continue;
+            if (_editing.TryGetValue(row, out var v))
+            {
+                _grid.Rows[gi].Cells[yGridCol].Value = FormatCellValue(v.Y, _activeYColumn.IsInteger);
+                if (_xColumn != null)
+                {
+                    int xGridCol = _xColumn.ColumnIndex + 1;
+                    _grid.Rows[gi].Cells[xGridCol].Value = FormatCellValue(v.X, _xColumn.IsInteger);
+                }
+            }
+        }
+    }
+
+    private void OnGridCellEdited(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (_snapshot == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
+        int col = e.ColumnIndex - 1;
+        if (col < 0 || col >= _snapshot.ColumnCount) return;
+        int row = _snapshot.RowNumbers[e.RowIndex];
+        var cell = _grid.Rows[e.RowIndex].Cells[e.ColumnIndex];
+        string text = cell.Value?.ToString() ?? "";
+        string oldText = CellText(col, row);
+        if (text == oldText) return;
+
+        // 更新曲线（若该列被绘制）
+        ApplyPlottedCellChange(col, row, text);
+
+        // 当前编辑列（可拖动那条）的编辑基线同步
+        if (_activeYColumn != null && col == _activeYColumn.ColumnIndex)
+        {
+            if (CellHelper.TryParseDouble(text, out var y))
+            {
+                double x = _editing.TryGetValue(row, out var ce) ? ce.X : row;
+                y = _activeYColumn.IsInteger ? Math.Round(y) : y;
+                _editing[row] = (x, y);
+                _committed[row] = (x, y);
+            }
+            else { _editing.Remove(row); _committed.Remove(row); }
+        }
+
+        UpdateSnapshotCell(row, col, text);
+        _dirtyCells.Add((col, row));
+        _undo.Add(new EditCmd(new List<(int, int, string, string)> { (col, row, oldText, text) }));
+        _redo.Clear();
+        UpdateStats();
+        UpdateTitle();
+        if (_autoSaveCheck.Checked) CommitPending();
+    }
+
+    private void ApplyPlottedCellChange(int col, int row, string text)
+    {
+        int si = _checkedCols.FindIndex(c => c.ColumnIndex == col);
+        if (si < 0) return;
+        if (CellHelper.TryParseDouble(text, out var y))
+        {
+            double x = row; bool xEditable = false;
+            if (_xColumn != null)
+            {
+                x = SnapshotValue(row, _xColumn.ColumnIndex, row);
+                xEditable = true;
+            }
+            _curve.SetSeriesPoint(si, row, x, y, xEditable);
+        }
+        else
+        {
+            _curve.RemoveSeriesPoint(si, row);
+        }
+        _curve.Invalidate();
+    }
+
+    private void OnGridCellClicked(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (_snapshot == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
+        int col = e.ColumnIndex - 1;
+        if (col < 0) return;
+        int row = _snapshot.RowNumbers[e.RowIndex];
+        int si = _checkedCols.FindIndex(c => c.ColumnIndex == col);
+        if (si < 0) return;
+        _syncFromGrid = true;
+        if (si != _curve.ActiveSeriesIndex) SetActiveSeries(si);
+        _curve.SelectPointByRow(row);
+        _syncFromGrid = false;
+    }
+
+    // ---------- 统计 ----------
+    private void UpdateStats()
+    {
+        _statLabel.Text = Statistics.Summarize(_curve.Points.Select(p => p.Y)).AsText();
+    }
+
+    // ---------- 批量 ----------
+    private void OnApplyValue() { double v = (double)_valUpDown.Value; _curve.ApplyToSelected(p => (p.X, v)); }
+    private void OpenContextAtChart()
+    {
+        BuildContextMenu();
+        _menu.Show(_curve, new Point(_curve.Width / 2, _curve.Height / 2));
+    }
+    private void BatchOffset(double d) => _curve.ApplyToSelected(p => (p.X, p.Y + d));
+    private void BatchScale(double k) => _curve.ApplyToSelected(p => (p.X, p.Y * k));
+    private void BatchClamp(double lo, double hi) => _curve.ApplyToSelected(p => (p.X, CurveMath.Clamp(p.Y, lo, hi)));
+    private void BatchSmooth()
+    {
+        var ys = _curve.Points.Select(p => p.Y).ToList();
+        if (ys.Count == 0) return;
+        var sm = CurveMath.MovingAverage(ys, 3);
+        int i = 0;
+        _curve.ApplyToAll(_ => (_.X, sm[i++]));
+    }
+    private void BatchNormalize()
+    {
+        var ys = _curve.Points.Select(p => p.Y).ToList();
+        if (ys.Count < 2) return;
+        double min = ys.Min(), max = ys.Max();
+        if (Math.Abs(max - min) < 1e-12) return;
+        _curve.ApplyToAll(p => (p.X, (p.Y - min) / (max - min)));
+    }
+    private void BatchRandom(double amp)
+    {
+        var rand = new Random();
+        _curve.ApplyToSelected(p => (p.X, p.Y + (rand.NextDouble() * 2 - 1) * amp));
+    }
+
+    // ---------- 撤销/重做 ----------
+    private void Undo()
+    {
+        if (_undo.Count == 0) { _statusLabel.Text = "没有可撤销的操作"; return; }
+        var cmd = _undo[^1]; _undo.RemoveAt(_undo.Count - 1); _redo.Add(cmd);
+        ApplyCmd(cmd, true);
+    }
+    private void Redo()
+    {
+        if (_redo.Count == 0) { _statusLabel.Text = "没有可重做的操作"; return; }
+        var cmd = _redo[^1]; _redo.RemoveAt(_redo.Count - 1); _undo.Add(cmd);
+        ApplyCmd(cmd, false);
+    }
+
+    private void ApplyCmd(EditCmd cmd, bool toOld)
+    {
+        if (_wb == null || _snapshot == null) return;
+        foreach (var (col, row, o, n) in cmd.Cells)
+        {
+            string val = toOld ? o : n;
+            UpdateSnapshotCell(row, col, val);
+            ApplyPlottedCellChange(col, row, val);
+            if (_activeYColumn != null && col == _activeYColumn.ColumnIndex)
+            {
+                if (CellHelper.TryParseDouble(val, out var y))
+                {
+                    double x = _editing.TryGetValue(row, out var ce) ? ce.X : row;
+                    y = _activeYColumn.IsInteger ? Math.Round(y) : y;
+                    _editing[row] = (x, y);
+                    _committed[row] = (x, y);
+                }
+                else { _editing.Remove(row); _committed.Remove(row); }
+            }
+            _dirtyCells.Add((col, row));
+            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                _grid.Rows[gi].Cells[col + 1].Value = val;
+        }
+        _curve.Invalidate();
+        UpdateStats();
+        UpdateTitle();
+        CommitPending();
+    }
+
+    // ---------- 保存/刷新/导出 ----------
+    private void OnSave() => CommitPending();
+
+    private void OnSaveAs()
+    {
+        if (_wb == null) return;
+        CommitPending();
+        using var sfd = new SaveFileDialog
+        {
+            Filter = "Excel 工作簿 (*.xlsm)|*.xlsm|Excel 工作簿 (*.xlsx)|*.xlsx",
+            FileName = Path.GetFileName(_wb.Path)
+        };
+        if (sfd.ShowDialog(this) == DialogResult.OK)
+        {
+            if (_wb.TrySaveAs(sfd.FileName, out var err)) _statusLabel.Text = "已另存为 " + sfd.FileName;
+            else MessageBox.Show(this, err, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OnExport()
+    {
+        using var sfd = new SaveFileDialog { Filter = "PNG 图片 (*.png)|*.png", FileName = "curve.png" };
+        if (sfd.ShowDialog(this) == DialogResult.OK) _curve.SaveBitmap(sfd.FileName);
+    }
+
+    private void OnReload()
+    {
+        if (_wb == null) return;
+        CommitPending();
+        ReloadFromDisk();
+    }
+
+    private void ReloadFromDisk()
+    {
+        if (_wb == null || string.IsNullOrEmpty(_activeSheet)) return;
+        try
+        {
+            _wb.RefreshMeta();
+            _snapshot = _wb.LoadSheet(_activeSheet);
+            RebuildFromSelection();
+            _statusLabel.Text = "已从磁盘重新加载";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "重新加载失败（文件可能被占用）：" + ex.Message;
+        }
+    }
+
+    // ---------- 布局切换 ----------
+    private void SetGridSide(bool atRight)
+    {
+        _gridAtRight = atRight;
+        foreach (ToolStripMenuItem item in _layoutButton.DropDownItems) item.Checked = false;
+        ((ToolStripMenuItem)_layoutButton.DropDownItems[atRight ? 1 : 0]).Checked = true;
+        _chartGridSplit.Orientation = atRight ? Orientation.Vertical : Orientation.Horizontal;
+        try
+        {
+            if (atRight) _chartGridSplit.SplitterDistance = Math.Max(200, (int)(_chartGridSplit.Width * 0.72));
+            else _chartGridSplit.SplitterDistance = Math.Max(140, (int)(_chartGridSplit.Height * 0.58));
+        }
+        catch { }
+        SaveSettings();
+    }
+
+    // ---------- 右键菜单 ----------
+    private int _menuSeries = -1;
+    private void BuildContextMenu()
+    {
+        _menu.Items.Clear();
+        var loc = _curve.PointToClient(Cursor.Position);
+        _menuSeries = _curve.HitTestAnySeries(loc);
+
+        if (_menuSeries >= 0)
+        {
+            string name = _curve.GetSeriesName(_menuSeries);
+            var setActive = new ToolStripMenuItem("设为当前编辑列：" + name) { ToolTipText = "此后拖动/按键/批量操作都作用于这条曲线" };
+            setActive.Click += (s, e) => SetActiveSeries(_menuSeries);
+            _menu.Items.Add(setActive);
+
+            var hide = new ToolStripMenuItem("隐藏该曲线") { ToolTipText = "从图面上隐藏这条曲线（不删除数据）" };
+            hide.Click += (s, e) => _curve.SetSeriesVisible(_menuSeries, false);
+            _menu.Items.Add(hide);
+
+            var only = new ToolStripMenuItem("仅显示该曲线") { ToolTipText = "隐藏其它曲线，只保留这条" };
+            only.Click += (s, e) => { for (int i = 0; i < _curve.SeriesCount; i++) _curve.SetSeriesVisible(i, i == _menuSeries); };
+            _menu.Items.Add(only);
+
+            var all = new ToolStripMenuItem("显示全部曲线") { ToolTipText = "恢复所有曲线可见" };
+            all.Click += (s, e) => { for (int i = 0; i < _curve.SeriesCount; i++) _curve.SetSeriesVisible(i, true); };
+            _menu.Items.Add(all);
+        }
+        else
+        {
+            var fit = new ToolStripMenuItem("自动适配视图") { ToolTipText = "重新缩放到显示全部数据" };
+            fit.Click += (s, e) => _curve.AutoFitView();
+            _menu.Items.Add(fit);
+        }
+
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(BuildBatchMenu());
+        var stats = new ToolStripMenuItem("查看统计") { ToolTipText = "当前编辑列的统计信息" };
+        stats.Click += (s, e) => MessageBox.Show(this, _statLabel.Text, "当前编辑列统计", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        _menu.Items.Add(stats);
+        _menu.Items.Add(new ToolStripSeparator());
+
+        if (_menuSeries >= 0)
+        {
+            var fit = new ToolStripMenuItem("自动适配视图") { ToolTipText = "重新缩放到显示全部数据" };
+            fit.Click += (s, e) => _curve.AutoFitView();
+            _menu.Items.Add(fit);
+        }
+        else
+        {
+            AddCheck(_menu, "平滑曲线", () => _curve.ShowSpline, v => _curve.ShowSpline = v);
+            AddCheck(_menu, "网格", () => _curve.ShowGrid, v => _curve.ShowGrid = v);
+            AddCheck(_menu, "数据点", () => _curve.ShowPoints, v => _curve.ShowPoints = v);
+            AddCheck(_menu, "坐标标签", () => _curve.ShowLabels, v => _curve.ShowLabels = v);
+            _menu.Items.Add(new ToolStripSeparator());
+            var exp = new ToolStripMenuItem("导出 PNG") { ToolTipText = "把当前曲线导出为图片" };
+            exp.Click += (s, e) => OnExport();
+            _menu.Items.Add(exp);
+            var reload = new ToolStripMenuItem("刷新重载") { ToolTipText = "重新从磁盘读取当前工作表" };
+            reload.Click += (s, e) => OnReload();
+            _menu.Items.Add(reload);
+            var open = new ToolStripMenuItem("打开工作簿...") { ToolTipText = "选择并打开另一个工作簿" };
+            open.Click += (s, e) => OnOpen();
+            _menu.Items.Add(open);
+        }
+    }
+
+    private void EnsureActiveHitSeries()
+    {
+        if (_menuSeries >= 0) SetActiveSeries(_menuSeries);
+    }
+
+    private ToolStripMenuItem BuildBatchMenu()
+    {
+        var menu = new ToolStripMenuItem("批量操作") { ToolTipText = "对当前编辑列的选中点/整列进行批量处理" };
+        AddBatch(menu, "设为值...", () =>
+        {
+            var v = PromptDouble("设为值", 0);
+            if (v.HasValue) { EnsureActiveHitSeries(); _curve.ApplyToSelected(p => (p.X, v.Value)); }
+        });
+        AddBatch(menu, "偏移...", () =>
+        {
+            var d = PromptDouble("偏移量（加减值）", 0);
+            if (d.HasValue) { EnsureActiveHitSeries(); BatchOffset(d.Value); }
+        });
+        AddBatch(menu, "缩放...", () =>
+        {
+            var k = PromptDouble("缩放倍数", 1);
+            if (k.HasValue) { EnsureActiveHitSeries(); BatchScale(k.Value); }
+        });
+        AddBatch(menu, "钳制 最小,最大...", () =>
+        {
+            var lo = PromptDouble("最小值", 0);
+            if (lo.HasValue)
+            {
+                var hi = PromptDouble("最大值", 100);
+                if (hi.HasValue) { EnsureActiveHitSeries(); BatchClamp(lo.Value, hi.Value); }
+            }
+        });
+        AddBatch(menu, "整列平滑", () => { EnsureActiveHitSeries(); BatchSmooth(); });
+        AddBatch(menu, "整列归一化", () => { EnsureActiveHitSeries(); BatchNormalize(); });
+        AddBatch(menu, "随机扰动...", () =>
+        {
+            var a = PromptDouble("扰动幅度（±）", 5);
+            if (a.HasValue) { EnsureActiveHitSeries(); BatchRandom(a.Value); }
+        });
+        return menu;
+    }
+
+    private static void AddBatch(ToolStripMenuItem parent, string text, Action action)
+    {
+        var item = new ToolStripMenuItem(text) { ToolTipText = text };
+        item.Click += (s, e) => action();
+        parent.DropDownItems.Add(item);
+    }
+
+    private double? PromptDouble(string title, double defaultValue)
+    {
+        using var f = new Form
+        {
+            Text = title,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(280, 130),
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+        f.Controls.Add(new Label { Text = "请输入数值：", AutoSize = true, Location = new Point(16, 18) });
+        var num = new NumericUpDown
+        {
+            DecimalPlaces = 6,
+            Minimum = -1.0E12m,
+            Maximum = 1.0E12m,
+            Value = Math.Clamp((decimal)defaultValue, -1.0E12m, 1.0E12m),
+            Location = new Point(130, 15),
+            Width = 120
+        };
+        f.Controls.Add(num);
+        var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Location = new Point(78, 66), Width = 80 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Location = new Point(168, 66), Width = 80 };
+        f.Controls.Add(ok);
+        f.Controls.Add(cancel);
+        f.AcceptButton = ok;
+        f.CancelButton = cancel;
+        return f.ShowDialog(this) == DialogResult.OK ? (double?)num.Value : null;
+    }
+
+    private static void AddCheck(ContextMenuStrip menu, string text, Func<bool> get, Action<bool> set)
+    {
+        var item = new ToolStripMenuItem(text) { Checked = get(), ToolTipText = "切换显示：勾选为显示" };
+        item.Click += (s, e) => { bool nv = !item.Checked; item.Checked = nv; set(nv); };
+        menu.Items.Add(item);
+    }
+
+    // ---------- 监视 ----------
+    private void SetupWatcher(string path)
+    {
+        _watcher?.Dispose();
+        var dir = Path.GetDirectoryName(path)!;
+        _watcher = new FileSystemWatcher(dir, Path.GetFileName(path))
+        {
+            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+            EnableRaisingEvents = true
+        };
+        _watcher.Changed += OnFileChanged;
+    }
+    private void OnFileChanged(object sender, FileSystemEventArgs e)
+    {
+        if (_selfWrite) return;
+        _reloadTimer.Stop();
+        _reloadTimer.Start();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (_wb != null && _dirtyCells.Count > 0)
+        {
+            var r = MessageBox.Show(this, "有未保存的改动，是否保存？", "确认", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel) { e.Cancel = true; return; }
+            if (r == DialogResult.Yes) CommitPending();
+        }
+        _watcher?.Dispose();
+        _autoSaveTimer.Stop();
+        _reloadTimer.Stop();
+        SaveSettings();
+        _wb?.Dispose();
+        base.OnFormClosing(e);
+    }
+
+    private void UpdateTitle()
+    {
+        var dirty = _dirtyCells.Count > 0 ? "（有未保存改动）" : "";
+        Text = "GameCurve - 游戏数据曲线编辑器" + (_wb != null ? " - " + Path.GetFileName(_wb.Path) : "") + dirty;
+    }
+
+    // ---------- UI 辅助 ----------
+    private static Label Section(string t) => new()
+    {
+        Text = t,
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold),
+        ForeColor = Color.FromArgb(49, 110, 244),
+        AutoSize = false,
+        Height = 30
+    };
+    private static Label MakeLabel(string t) => new() { Text = t, AutoSize = true };
+    private static Label MakeHint(string t) => new()
+    {
+        Text = t,
+        AutoSize = false,
+        Height = 36,
+        Font = new Font("Microsoft YaHei UI", 8f),
+        ForeColor = Color.FromArgb(100, 106, 114)
+    };
+    private static Button MakeButton(string text, Action onClick)
+    {
+        var b = new Button { Text = text, Height = 30 };
+        b.Click += (s, e) => onClick();
+        return b;
+    }
+    private static ToolStripMenuItem MakeMenu(string text, string tooltip, Action onClick, bool check)
+    {
+        var m = new ToolStripMenuItem(text) { ToolTipText = tooltip, Checked = check, CheckOnClick = false };
+        m.Click += (s, e) => onClick();
+        return m;
+    }
+
+    private void AddButton(string text, string tooltip, Action onClick)
+    {
+        var b = new ToolStripButton(text) { ToolTipText = tooltip };
+        b.Click += (s, e) => onClick();
+        _tool.Items.Add(b);
+    }
+
+    private void BuildTooltips()
+    {
+        Tip(_colsChecked, "勾选要显示成曲线的数值列；右键图表可把某条曲线设为当前编辑列");
+        Tip(_xCombo, "选择 X 轴：默认行号，或选某一数值列作为 X（此时拖动可横移该列单元格）");
+        Tip(_valUpDown, "输入数值后点“应用到选中”把选中点都设为该值");
+        Tip(_stepUpDown, "方向键微调步长；按住 Shift 为 ×10，按住 Ctrl 为 ×0.1");
+        Tip(_offsetUpDown, "对选中点整体增加或减少的数值（配合“偏移 Δ”按钮）");
+        Tip(_scaleUpDown, "对选中点整体放大/缩小的倍数（配合“缩放 ×”按钮）");
+        Tip(_clampMin, "钳制最小值");
+        Tip(_clampMax, "钳制最大值");
+        Tip(_randUpDown, "随机扰动幅度（±，配合“随机扰动”按钮）");
+        Tip(_statLabel, "当前编辑列的统计信息（最大/平均/总和/标准差等）");
+        Tip(_curve, "单击选点 · Ctrl 加选 · 拖拽移动 · 空白拖框选 · Ctrl+A 全选 · ↑↓←→微调 · 滚轮缩放 · 右键菜单 · 双击自适应");
+        Tip(_grid, "黄色列为当前可编辑列：双击/选中后输入数字回车，曲线即时更新；其余列只读");
+    }
+
+    private void Tip(Control c, string t) => _tip.SetToolTip(c, t);
+
+    private void OnSelectionChangedUi()
+    {
+        _selInfo.Text = "选中: " + _curve.SelectedCount;
+        if (_curve.SelectedCount > 0)
+        {
+            var first = _curve.Points.Where(p => _curve.SelectedRows.Contains(p.RowNumber)).FirstOrDefault();
+            if (first != null)
+            {
+                _valUpDown.Value = Math.Clamp((decimal)first.Y, _valUpDown.Minimum, _valUpDown.Maximum);
+                // 来自表格点击时不再滚动/定位（避免跳动）
+                if (_syncFromGrid) return;
+                if (_rowToGridIndex.TryGetValue(first.RowNumber, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                {
+                    _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, gi);
+                    if (_activeYColumn != null)
+                    {
+                        int col = _activeYColumn.ColumnIndex + 1;
+                        if (col < _grid.Columns.Count)
+                        {
+                            _grid.CurrentCell = _grid.Rows[gi].Cells[col];
+                            _grid.Rows[gi].Selected = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
