@@ -188,7 +188,7 @@ public sealed class MainForm : Form
             }
         }
         L(Section("曲线列 (Y) 多选"));
-        L(_colsChecked, 190);
+        L(_colsChecked, 475);
         ly += 8;
         L(Section("X 轴"));
         L(_xCombo, 26);
