@@ -59,6 +59,8 @@ public sealed class MainForm : Form
     private SplitContainer _chartGridSplit = null!;
     private TableLayoutPanel _chartArea = null!;
     private readonly ContextMenuStrip _menu = new();
+    private readonly ContextMenuStrip _fitStrip = new();
+    private Button _fitButton = null!;
     private Panel _gridPane = null!;
     private readonly Panel _rightPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
     private readonly Panel _leftPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
@@ -251,6 +253,8 @@ public sealed class MainForm : Form
         R(MakeLabel("随机扰动幅度:"), 20);
         R(_randUpDown, 28);
         R(MakeButton("随机扰动", () => BatchRandom((double)_randUpDown.Value)), 30);
+        _fitButton = MakeButton("拟合选中点", ShowFitMenu);
+        R(_fitButton, 30);
         R(MakeButton("右键更多操作", OpenContextAtChart), 30);
         ry += 10;
         R(Section("统计"));
@@ -1241,6 +1245,8 @@ public sealed class MainForm : Form
         }
 
         _menu.Items.Add(new ToolStripSeparator());
+        if (_curve.SelectedCount >= 2)
+            _menu.Items.Add(BuildFitMenu());
         _menu.Items.Add(BuildBatchMenu());
         var stats = new ToolStripMenuItem("查看统计");
         stats.Click += (s, e) => MessageBox.Show(this, _statLabel.Text, "当前编辑列统计", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1319,6 +1325,51 @@ public sealed class MainForm : Form
         var item = new ToolStripMenuItem(text);
         item.Click += (s, e) => action();
         parent.DropDownItems.Add(item);
+    }
+
+    private ToolStripMenuItem BuildFitMenu()
+    {
+        var fit = new ToolStripMenuItem("拟合选中点");
+        fit.DropDownItems.Add(AddFitItem("直线  y=ax+b", CurveFit.Kind.Linear));
+        fit.DropDownItems.Add(AddFitItem("指数  y=a*e^(bx)", CurveFit.Kind.Exponential));
+        fit.DropDownItems.Add(AddFitItem("对数  y=a+b*ln(x)", CurveFit.Kind.Logarithmic));
+        fit.DropDownItems.Add(AddFitItem("幂函数  y=a*x^b", CurveFit.Kind.Power));
+        fit.DropDownItems.Add(AddFitItem("二次多项式", CurveFit.Kind.Quadratic));
+        fit.DropDownItems.Add(AddFitItem("三次多项式", CurveFit.Kind.Cubic));
+        return fit;
+    }
+
+    private ToolStripMenuItem AddFitItem(string text, CurveFit.Kind kind)
+    {
+        var item = new ToolStripMenuItem(text);
+        item.Click += (s, e) => FitSelected(kind);
+        return item;
+    }
+
+    private void ShowFitMenu()
+    {
+        _fitStrip.Items.Clear();
+        foreach (ToolStripItem item in BuildFitMenu().DropDownItems)
+            _fitStrip.Items.Add(item);
+        _fitStrip.Show(_fitButton, new Point(0, _fitButton.Height));
+    }
+
+    private void FitSelected(CurveFit.Kind kind)
+    {
+        var pts = _curve.GetSelectedPoints();
+        if (pts.Count < 2)
+        {
+            _statusLabel.Text = "请先选择至少 2 个点，再执行拟合";
+            return;
+        }
+        var f = CurveFit.Fit(pts.Select(p => (p.X, p.Y)).ToArray(), kind, out var formula, out var err);
+        if (f == null)
+        {
+            MessageBox.Show(this, err, "拟合失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        _curve.ApplyToSelected(p => (p.X, f(p.X)));
+        _statusLabel.Text = $"已按{CurveFit.NameOf(kind)}拟合 {pts.Count} 个点  {formula}";
     }
 
     private double? PromptDouble(string title, double defaultValue)

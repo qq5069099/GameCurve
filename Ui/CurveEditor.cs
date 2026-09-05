@@ -198,6 +198,14 @@ public sealed class CurveEditor : Control
         if (commit) EditCommitted?.Invoke();
     }
 
+    /// <summary>返回当前编辑列上被选中点的数据（按列表索引升序）。</summary>
+    public IReadOnlyList<CurvePoint> GetSelectedPoints()
+    {
+        var list = ActiveSeries?.Points;
+        if (list == null) return Array.Empty<CurvePoint>();
+        return _selected.OrderBy(i => i).Select(i => list[i]).ToArray();
+    }
+
     public void ClearSelection()
     {
         if (_selected.Count == 0) return;
