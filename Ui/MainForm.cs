@@ -7,7 +7,7 @@ namespace GameCurve.Ui;
 
 public sealed class MainForm : Form
 {
-    private const int LeftPanelWidth = 200;   // 左侧功能面板宽度
+    private const int LeftPanelWidth = 260;   // 左侧功能面板宽度
     private const int RightPanelWidth = 260;  // 可完整容纳编辑/批量/统计控件
 
     private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
@@ -75,6 +75,7 @@ public sealed class MainForm : Form
     private readonly Dictionary<int, int> _rowToGridIndex = new();
     private readonly HashSet<(int Col, int Row)> _dirtyCells = new();
     private readonly HashSet<int> _pendingUndoRows = new();
+    private readonly Dictionary<(int Col, int Row), string> _subEditOldText = new();
 
     private bool _gridAtRight;
     private bool _suppressRebuild;
@@ -500,6 +501,7 @@ public sealed class MainForm : Form
     {
         _dirtyCells.Clear();
         _pendingUndoRows.Clear();
+        _subEditOldText.Clear();
         _editing.Clear();
         _committed.Clear();
         _undo.Clear();
@@ -574,6 +576,7 @@ public sealed class MainForm : Form
 
             _committed.Clear(); _editing.Clear();
             _pendingUndoRows.Clear();
+            _subEditOldText.Clear();
             _undo.Clear(); _redo.Clear();
             foreach (var p in _curve.Points)
             {
@@ -637,6 +640,7 @@ public sealed class MainForm : Form
         _curve.YAxisLabel = _activeYColumn.DisplayName;
         _committed.Clear(); _editing.Clear();
         _pendingUndoRows.Clear();
+        _subEditOldText.Clear();
         foreach (var p in _curve.Points)
         {
             _committed[p.RowNumber] = (p.X, p.Y);
@@ -690,6 +694,7 @@ public sealed class MainForm : Form
                 if (_activeYColumn.IsSubCurve)
                 {
                     string oldRaw = CellText(col, row);
+                    _subEditOldText.TryAdd((col, row), oldRaw);
                     UpdateSnapshotCell(row, col, SubCurveHelper.SetValue(oldRaw, _activeYColumn, p.Y));
                 }
                 else
@@ -699,9 +704,14 @@ public sealed class MainForm : Form
             {
                 int xCol = _xColumn.Column.ColumnIndex;
                 _dirtyCells.Add((xCol, row));
-                UpdateSnapshotCell(row, xCol, _xColumn.IsSubCurve
-                    ? SubCurveHelper.SetValue(CellText(xCol, row), _xColumn, p.X)
-                    : FormatCellValue(p.X, _xColumn.IsInteger));
+                if (_xColumn.IsSubCurve)
+                {
+                    string oldRaw = CellText(xCol, row);
+                    _subEditOldText.TryAdd((xCol, row), oldRaw);
+                    UpdateSnapshotCell(row, xCol, SubCurveHelper.SetValue(oldRaw, _xColumn, p.X));
+                }
+                else
+                    UpdateSnapshotCell(row, xCol, FormatCellValue(p.X, _xColumn.IsInteger));
             }
             _pendingUndoRows.Add(row);
         }
@@ -726,10 +736,28 @@ public sealed class MainForm : Form
             if (!_editing.TryGetValue(row, out var cur)) continue;
             var old = _committed.TryGetValue(row, out var o) ? o : cur;
             if (Math.Abs(old.X - cur.X) < 1e-12 && Math.Abs(old.Y - cur.Y) < 1e-12) continue;
-            if (_activeYColumn != null && !_activeYColumn.IsSubCurve)
-                items.Add((_activeYColumn.Column.ColumnIndex, row, FormatCellValue(old.Y, _activeYColumn.IsInteger), FormatCellValue(cur.Y, _activeYColumn.IsInteger)));
-            if (_xColumn != null && !_xColumn.IsSubCurve && TryGetPoint(row, out var p) && p.XEditable && Math.Abs(old.X - cur.X) > 1e-12)
-                items.Add((_xColumn.Column.ColumnIndex, row, FormatCellValue(old.X, _xColumn.IsInteger), FormatCellValue(cur.X, _xColumn.IsInteger)));
+            if (_activeYColumn != null)
+            {
+                int col = _activeYColumn.Column.ColumnIndex;
+                if (_activeYColumn.IsSubCurve)
+                {
+                    if (_subEditOldText.Remove((col, row), out var oldRaw))
+                        items.Add((col, row, oldRaw, CellText(col, row)));
+                }
+                else
+                    items.Add((col, row, FormatCellValue(old.Y, _activeYColumn.IsInteger), FormatCellValue(cur.Y, _activeYColumn.IsInteger)));
+            }
+            if (_xColumn != null && TryGetPoint(row, out var p) && p.XEditable && Math.Abs(old.X - cur.X) > 1e-12)
+            {
+                int xCol = _xColumn.Column.ColumnIndex;
+                if (_xColumn.IsSubCurve)
+                {
+                    if (_subEditOldText.Remove((xCol, row), out var oldRaw))
+                        items.Add((xCol, row, oldRaw, CellText(xCol, row)));
+                }
+                else
+                    items.Add((xCol, row, FormatCellValue(old.X, _xColumn.IsInteger), FormatCellValue(cur.X, _xColumn.IsInteger)));
+            }
             _committed[row] = cur;
         }
         if (items.Count > 0) { _undo.Add(new EditCmd(items)); _redo.Clear(); }
@@ -1046,10 +1074,22 @@ public sealed class MainForm : Form
         {
             string val = toOld ? o : n;
             UpdateSnapshotCell(row, col, val);
-            ApplyPlottedCellChange(col, row, val);
+            if (HasSubCurveForColumn(col))
+                RefreshSubSeriesForColumnRow(col, row);
+            else
+                ApplyPlottedCellChange(col, row, val);
             if (_activeYColumn != null && col == _activeYColumn.Column.ColumnIndex)
             {
-                if (CellHelper.TryParseDouble(val, out var y))
+                if (_activeYColumn.IsSubCurve)
+                {
+                    if (TryGetPoint(row, out var sp))
+                    {
+                        _editing[row] = (sp.X, sp.Y);
+                        _committed[row] = (sp.X, sp.Y);
+                    }
+                    else { _editing.Remove(row); _committed.Remove(row); }
+                }
+                else if (CellHelper.TryParseDouble(val, out var y))
                 {
                     double x = _editing.TryGetValue(row, out var ce) ? ce.X : row;
                     y = _activeYColumn.IsInteger ? Math.Round(y) : y;
@@ -1066,6 +1106,40 @@ public sealed class MainForm : Form
         UpdateStats();
         UpdateTitle();
         CommitPending();
+    }
+
+    private bool HasSubCurveForColumn(int col)
+        => _checkedCols.Any(o => o.Column.ColumnIndex == col && o.IsSubCurve);
+
+    private void RefreshSubSeriesForColumnRow(int col, int row)
+    {
+        for (int si = 0; si < _checkedCols.Count; si++)
+        {
+            var opt = _checkedCols[si];
+            if (opt.Column.ColumnIndex != col || !opt.IsSubCurve) continue;
+
+            double? y = null;
+            if (_rowToGridIndex.TryGetValue(row, out var gi) &&
+                gi >= 0 && gi < _snapshot!.Grid.Count &&
+                SubCurveHelper.TryReadValue(_snapshot, opt, gi, out var v))
+                y = v;
+
+            if (y.HasValue)
+            {
+                double x = row;
+                bool xEditable = false;
+                var existing = _series[si].Points.FirstOrDefault(pp => pp.RowNumber == row);
+                if (existing != null)
+                {
+                    x = existing.X;
+                    xEditable = existing.XEditable;
+                }
+                _curve.SetSeriesPoint(si, row, x, y.Value, xEditable);
+            }
+            else
+                _curve.RemoveSeriesPoint(si, row);
+        }
+        _curve.Invalidate();
     }
 
     // ---------- 保存/刷新/导出 ----------

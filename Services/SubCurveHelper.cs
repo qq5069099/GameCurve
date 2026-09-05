@@ -251,7 +251,8 @@ public static class SubCurveHelper
     /// <summary>修改子曲线后，重新生成整格文本（数组或 JSON 对象字符串）。</summary>
     public static string SetValue(string raw, CurveColumnOption opt, double y)
     {
-        if (IsIntegerArray(opt.Column)) y = Math.Round(y, MidpointRounding.AwayFromZero);
+        bool asLong = IsIntegerArray(opt.Column) || opt.IsJsonValue;
+        if (asLong) y = Math.Round(y, MidpointRounding.AwayFromZero);
         if (opt.SubIndex >= 0)
             return SetArrayValue(raw, opt.SubIndex, y);
 
@@ -277,7 +278,7 @@ public static class SubCurveHelper
                 target = obj;
 
             if (target != null)
-                target["v"] = JsonValue.Create(y);
+                target["v"] = asLong ? JsonValue.Create((long)y) : JsonValue.Create(y);
             return node.ToJsonString(new JsonSerializerOptions
             {
                 WriteIndented = false,
