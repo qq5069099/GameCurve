@@ -7,7 +7,7 @@ namespace GameCurve.Ui;
 
 public sealed class MainForm : Form
 {
-    private const int LeftPanelWidth = 165;   // 左侧功能面板宽度
+    private const int LeftPanelWidth = 200;   // 左侧功能面板宽度
     private const int RightPanelWidth = 260;  // 可完整容纳编辑/批量/统计控件
 
     private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
@@ -158,9 +158,7 @@ public sealed class MainForm : Form
         AddButton("重做", "重做上次撤销（Ctrl+Y）", () => Redo());
         _tool.Items.Add(new ToolStripSeparator());
         AddButton("导出PNG", "把当前曲线图导出为 PNG 图片", OnExport);
-        _autoSaveCheck.ToolTipText = "勾选后拖动点/按键调整会自动写回 Excel；默认关闭，需手动点“保存”";
         _tool.Items.Add(_autoSaveCheck);
-        _layoutButton.ToolTipText = "切换表格与曲线区的布局：底部 或 右侧并列";
         _layoutButton.DropDownItems.Add(MakeMenu("表格置底", "表格放在曲线区下方", () => SetGridSide(false), true));
         _layoutButton.DropDownItems.Add(MakeMenu("表格靠右", "表格与曲线区左右并列", () => SetGridSide(true), false));
         _tool.Items.Add(_layoutButton);
@@ -442,7 +440,6 @@ public sealed class MainForm : Form
             b.BackColor = active ? Color.FromArgb(49, 110, 244) : Color.FromArgb(214, 220, 228);
             b.ForeColor = active ? Color.White : Color.FromArgb(50, 56, 64);
             b.FlatAppearance.BorderSize = active ? 0 : 0;
-            _tip.SetToolTip(b, "切换到此工作表");
         }
     }
 
@@ -1035,39 +1032,39 @@ public sealed class MainForm : Form
         if (_menuSeries >= 0)
         {
             string name = _curve.GetSeriesName(_menuSeries);
-            var setActive = new ToolStripMenuItem("设为当前编辑列：" + name) { ToolTipText = "此后拖动/按键/批量操作都作用于这条曲线" };
+            var setActive = new ToolStripMenuItem("设为当前编辑列：" + name);
             setActive.Click += (s, e) => SetActiveSeries(_menuSeries);
             _menu.Items.Add(setActive);
 
-            var hide = new ToolStripMenuItem("隐藏该曲线") { ToolTipText = "从图面上隐藏这条曲线（不删除数据）" };
+            var hide = new ToolStripMenuItem("隐藏该曲线");
             hide.Click += (s, e) => _curve.SetSeriesVisible(_menuSeries, false);
             _menu.Items.Add(hide);
 
-            var only = new ToolStripMenuItem("仅显示该曲线") { ToolTipText = "隐藏其它曲线，只保留这条" };
+            var only = new ToolStripMenuItem("仅显示该曲线");
             only.Click += (s, e) => { for (int i = 0; i < _curve.SeriesCount; i++) _curve.SetSeriesVisible(i, i == _menuSeries); };
             _menu.Items.Add(only);
 
-            var all = new ToolStripMenuItem("显示全部曲线") { ToolTipText = "恢复所有曲线可见" };
+            var all = new ToolStripMenuItem("显示全部曲线");
             all.Click += (s, e) => { for (int i = 0; i < _curve.SeriesCount; i++) _curve.SetSeriesVisible(i, true); };
             _menu.Items.Add(all);
         }
         else
         {
-            var fit = new ToolStripMenuItem("自动适配视图") { ToolTipText = "重新缩放到显示全部数据" };
+            var fit = new ToolStripMenuItem("自动适配视图");
             fit.Click += (s, e) => _curve.AutoFitView();
             _menu.Items.Add(fit);
         }
 
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(BuildBatchMenu());
-        var stats = new ToolStripMenuItem("查看统计") { ToolTipText = "当前编辑列的统计信息" };
+        var stats = new ToolStripMenuItem("查看统计");
         stats.Click += (s, e) => MessageBox.Show(this, _statLabel.Text, "当前编辑列统计", MessageBoxButtons.OK, MessageBoxIcon.Information);
         _menu.Items.Add(stats);
         _menu.Items.Add(new ToolStripSeparator());
 
         if (_menuSeries >= 0)
         {
-            var fit = new ToolStripMenuItem("自动适配视图") { ToolTipText = "重新缩放到显示全部数据" };
+            var fit = new ToolStripMenuItem("自动适配视图");
             fit.Click += (s, e) => _curve.AutoFitView();
             _menu.Items.Add(fit);
         }
@@ -1078,13 +1075,13 @@ public sealed class MainForm : Form
             AddCheck(_menu, "数据点", () => _curve.ShowPoints, v => _curve.ShowPoints = v);
             AddCheck(_menu, "坐标标签", () => _curve.ShowLabels, v => _curve.ShowLabels = v);
             _menu.Items.Add(new ToolStripSeparator());
-            var exp = new ToolStripMenuItem("导出 PNG") { ToolTipText = "把当前曲线导出为图片" };
+            var exp = new ToolStripMenuItem("导出 PNG");
             exp.Click += (s, e) => OnExport();
             _menu.Items.Add(exp);
-            var reload = new ToolStripMenuItem("刷新重载") { ToolTipText = "重新从磁盘读取当前工作表" };
+            var reload = new ToolStripMenuItem("刷新重载");
             reload.Click += (s, e) => OnReload();
             _menu.Items.Add(reload);
-            var open = new ToolStripMenuItem("打开工作簿...") { ToolTipText = "选择并打开另一个工作簿" };
+            var open = new ToolStripMenuItem("打开工作簿...");
             open.Click += (s, e) => OnOpen();
             _menu.Items.Add(open);
         }
@@ -1097,7 +1094,7 @@ public sealed class MainForm : Form
 
     private ToolStripMenuItem BuildBatchMenu()
     {
-        var menu = new ToolStripMenuItem("批量操作") { ToolTipText = "对当前编辑列的选中点/整列进行批量处理" };
+        var menu = new ToolStripMenuItem("批量操作");
         AddBatch(menu, "设为值...", () =>
         {
             var v = PromptDouble("设为值", 0);
@@ -1134,7 +1131,7 @@ public sealed class MainForm : Form
 
     private static void AddBatch(ToolStripMenuItem parent, string text, Action action)
     {
-        var item = new ToolStripMenuItem(text) { ToolTipText = text };
+        var item = new ToolStripMenuItem(text);
         item.Click += (s, e) => action();
         parent.DropDownItems.Add(item);
     }
@@ -1172,7 +1169,7 @@ public sealed class MainForm : Form
 
     private static void AddCheck(ContextMenuStrip menu, string text, Func<bool> get, Action<bool> set)
     {
-        var item = new ToolStripMenuItem(text) { Checked = get(), ToolTipText = "切换显示：勾选为显示" };
+        var item = new ToolStripMenuItem(text) { Checked = get() };
         item.Click += (s, e) => { bool nv = !item.Checked; item.Checked = nv; set(nv); };
         menu.Items.Add(item);
     }
@@ -1252,22 +1249,21 @@ public sealed class MainForm : Form
 
     private static ToolStripMenuItem MakeMenu(string text, string tooltip, Action onClick, bool check)
     {
-        var m = new ToolStripMenuItem(text) { ToolTipText = tooltip, Checked = check, CheckOnClick = false };
+        var m = new ToolStripMenuItem(text) { Checked = check, CheckOnClick = false };
         m.Click += (s, e) => onClick();
         return m;
     }
 
     private void AddButton(string text, string tooltip, Action onClick)
     {
-        var b = new ToolStripButton(text) { ToolTipText = tooltip };
+        var b = new ToolStripButton(text);
         b.Click += (s, e) => onClick();
         _tool.Items.Add(b);
     }
 
     private void BuildTooltips()
     {
-        Tip(_colsChecked, "勾选要显示成曲线的数值列；右键图表可把某条曲线设为当前编辑列");
-        Tip(_xCombo, "选择 X 轴：默认行号，或选某一数值列作为 X（此时拖动可横移该列单元格）");
+        // 仅保留右侧功能面板控件的提示
         Tip(_valUpDown, "输入数值后点“应用到选中”把选中点都设为该值");
         Tip(_stepUpDown, "方向键微调步长；按住 Shift 为 ×10，按住 Ctrl 为 ×0.1");
         Tip(_offsetUpDown, "对选中点整体增加或减少的数值（配合“偏移 Δ”按钮）");
@@ -1276,8 +1272,6 @@ public sealed class MainForm : Form
         Tip(_clampMax, "钳制最大值");
         Tip(_randUpDown, "随机扰动幅度（±，配合“随机扰动”按钮）");
         Tip(_statLabel, "当前编辑列的统计信息（最大/平均/总和/标准差等）");
-        Tip(_curve, "单击选点 · Ctrl 加选 · 拖拽移动 · 空白拖框选 · Ctrl+A 全选 · ↑↓←→微调 · 滚轮缩放 · 中键平移 · 右键菜单 · 双击自适应");
-        Tip(_grid, "黄色列为当前可编辑列：双击/选中后输入数字回车，曲线即时更新；其余列只读");
     }
 
     private void Tip(Control c, string t) => _tip.SetToolTip(c, t);

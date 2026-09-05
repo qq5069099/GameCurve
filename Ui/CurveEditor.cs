@@ -22,6 +22,9 @@ public sealed class CurveEditor : Control
     private readonly List<CurveSeriesView> _series = new();
     private readonly HashSet<int> _selected = new();
 
+    // 护眼暗色画布底
+    private static readonly Color CanvasBack = Color.FromArgb(30, 34, 42);
+
     private double _xMin, _xMax, _yMin, _yMax;
     private bool _hasView;
 
@@ -32,7 +35,6 @@ public sealed class CurveEditor : Control
     private readonly Dictionary<int, (double X, double Y)> _dragInitial = new();
     private bool _dragged;
     private Point _mouseDown;
-    private readonly ToolTip _tooltip = new();
     private int _hoverIndex = -1;
     private bool _additiveSelect;
     private Rectangle _marquee;
@@ -67,7 +69,7 @@ public sealed class CurveEditor : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                  ControlStyles.Selectable, true);
-        BackColor = Color.FromArgb(244, 246, 249);
+        BackColor = Color.FromArgb(38, 42, 48);
         TabStop = true;
     }
 
@@ -308,7 +310,7 @@ public sealed class CurveEditor : Control
 
         // 绘图区域背景
         var plot = PlotRect;
-        using (var bg = new SolidBrush(Color.White))
+        using (var bg = new SolidBrush(CanvasBack))
             g.FillRectangle(bg, plot);
 
         if (_series.Count == 0)
@@ -335,10 +337,10 @@ public sealed class CurveEditor : Control
 
     private void DrawGridAndAxes(Graphics g, Rectangle plot)
     {
-        var major = Color.FromArgb(224, 228, 234);
-        var minor = Color.FromArgb(238, 241, 245);
-        var axisColor = Color.FromArgb(120, 128, 140);
-        var textColor = Color.FromArgb(70, 76, 84);
+        var major = Color.FromArgb(70, 78, 88);
+        var minor = Color.FromArgb(52, 60, 68);
+        var axisColor = Color.FromArgb(150, 160, 170);
+        var textColor = Color.FromArgb(185, 195, 205);
         using var majorPen = new Pen(major, 1f);
         using var minorPen = new Pen(minor, 1f);
         using var axisPen = new Pen(axisColor, 1.2f);
@@ -564,8 +566,8 @@ public sealed class CurveEditor : Control
         }
         else if (_drag == DragMode.Pan)
         {
-            double wx = (e.X - _lastPan) / Math.Max(1, PlotW) * (_xMax - _xMin);
-            double wy = (e.Y - _lastPanY) / Math.Max(1, PlotH) * (_yMax - _yMin);
+            double wx = (e.X - _lastPan) / (double)Math.Max(1, PlotW) * (_xMax - _xMin);
+            double wy = (e.Y - _lastPanY) / (double)Math.Max(1, PlotH) * (_yMax - _yMin);
             _xMin -= wx; _xMax -= wx;
             _yMin += wy; _yMax += wy;
             _lastPan = e.X; _lastPanY = e.Y;
@@ -640,7 +642,6 @@ public sealed class CurveEditor : Control
         if (_hoverIndex >= 0)
         {
             _hoverIndex = -1;
-            _tooltip.Hide(this);
             HoverChanged?.Invoke("");
             Invalidate();
         }
@@ -714,15 +715,13 @@ public sealed class CurveEditor : Control
         if (hit != _hoverIndex)
         {
             _hoverIndex = hit;
-            if (hit >= 0 && ActiveSeries != null)
+            if (hit >= 0)
             {
-                var p = ActiveSeries.Points[hit];
-                _tooltip.Show($"行:{p.RowNumber}  Y:{p.Y:0.###}", this, location.X + 14, location.Y - 22);
+                var p = ActiveSeries!.Points[hit];
                 HoverChanged?.Invoke($"行:{p.RowNumber}  X:{p.X:0.###}  Y:{p.Y:0.###}");
             }
             else
             {
-                _tooltip.Hide(this);
                 HoverChanged?.Invoke("");
             }
             Invalidate();
