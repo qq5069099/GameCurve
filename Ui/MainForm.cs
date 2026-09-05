@@ -1393,6 +1393,7 @@ public sealed class MainForm : Form
 
     private void OnSelectionChangedUi()
     {
+        EnsureActiveSeriesSynced();
         _selInfo.Text = "选中: " + _curve.SelectedCount;
         if (_curve.SelectedCount > 0)
         {
@@ -1432,5 +1433,26 @@ public sealed class MainForm : Form
                 }
             }
         }
+    }
+
+    /// <summary>曲线控件内部切换当前编辑列时，同步主界面的编辑列元数据。</summary>
+    private void EnsureActiveSeriesSynced()
+    {
+        int idx = _curve.ActiveSeriesIndex;
+        if (idx < 0 || idx >= _checkedCols.Count) return;
+        if (_activeYColumn == _checkedCols[idx]) return;
+        CommitPending();
+        _activeYColumn = _checkedCols[idx];
+        _curve.YAxisLabel = _activeYColumn.DisplayName;
+        _committed.Clear();
+        _editing.Clear();
+        _pendingUndoRows.Clear();
+        foreach (var p in _curve.Points)
+        {
+            _committed[p.RowNumber] = (p.X, p.Y);
+            _editing[p.RowNumber] = (p.X, p.Y);
+        }
+        HighlightEditableColumn();
+        SyncActiveColumnHighlight(idx);
     }
 }

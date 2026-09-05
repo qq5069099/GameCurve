@@ -96,12 +96,15 @@ public sealed class CurveEditor : Control
         Invalidate();
     }
 
-    public void SetActiveSeries(int index)
+    public void SetActiveSeries(int index, bool autoFit = true)
     {
         ActiveSeriesIndex = index;
         _selected.Clear();
-        _hasView = false;
-        AutoFitView();
+        if (autoFit)
+        {
+            _hasView = false;
+            AutoFitView();
+        }
         Invalidate();
         SelectionChanged?.Invoke();
     }
@@ -269,8 +272,8 @@ public sealed class CurveEditor : Control
 
     public void AutoFitView()
     {
-        var pts = ActiveSeries?.Points;
-        if (pts == null || pts.Count == 0)
+        var pts = _series.Where(s => s.Visible).SelectMany(s => s.Points).ToList();
+        if (pts.Count == 0)
         {
             _xMin = 0; _xMax = 100; _yMin = 0; _yMax = 100;
             _hasView = true;
@@ -319,6 +322,31 @@ public sealed class CurveEditor : Control
             }
         }
         return -1;
+    }
+
+    /// <summary>命中任意可见曲线，返回曲线索引和点索引。</summary>
+    private bool HitTestAnySeriesDetailed(Point location, out int seriesIndex, out int pointIndex)
+    {
+        seriesIndex = -1;
+        pointIndex = -1;
+        double bestDist = 12;
+        for (int si = 0; si < _series.Count; si++)
+        {
+            var ser = _series[si];
+            if (!ser.Visible) continue;
+            for (int pi = 0; pi < ser.Points.Count; pi++)
+            {
+                var sp = WorldToScreen(ser.Points[pi].X, ser.Points[pi].Y);
+                double d = Math.Sqrt((sp.X - location.X) * (sp.X - location.X) + (sp.Y - location.Y) * (sp.Y - location.Y));
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    seriesIndex = si;
+                    pointIndex = pi;
+                }
+            }
+        }
+        return seriesIndex >= 0;
     }
 
     // ---------- 绘制 ----------
@@ -531,7 +559,11 @@ public sealed class CurveEditor : Control
             return;
         }
 
-        int hit = HitTest(e.Location);
+        // 点选时命中任意可见曲线；命中其它曲线时先切换为当前编辑列
+        bool hitAny = HitTestAnySeriesDetailed(e.Location, out var hitSeries, out var hitPoint);
+        if (hitAny && hitSeries != ActiveSeriesIndex)
+            SetActiveSeries(hitSeries, autoFit: false);
+        int hit = hitAny ? hitPoint : -1;
         bool ctrl = (ModifierKeys & Keys.Control) != 0;
         if (hit >= 0)
         {
@@ -638,18 +670,31 @@ public sealed class CurveEditor : Control
             else
             {
                 var rect = Normalize(_marquee);
-                var list = ActiveSeries?.Points;
-                if (list != null)
+                int bestSeries = -1;
+                var bestHits = new List<int>();
+                for (int si = 0; si < _series.Count; si++)
                 {
-                    for (int i = 0; i < list.Count; i++)
+                    var ser = _series[si];
+                    if (!ser.Visible) continue;
+                    var hits = new List<int>();
+                    for (int i = 0; i < ser.Points.Count; i++)
                     {
-                        var sp = WorldToScreen(list[i].X, list[i].Y);
+                        var sp = WorldToScreen(ser.Points[i].X, ser.Points[i].Y);
                         if (rect.Contains((int)sp.X, (int)sp.Y))
-                        {
-                            if (_additiveSelect) _selected.Add(i);
-                            else _selected.Add(i);
-                        }
+                            hits.Add(i);
                     }
+                    if (hits.Count > bestHits.Count)
+                    {
+                        bestHits = hits;
+                        bestSeries = si;
+                    }
+                }
+
+                if (bestSeries >= 0 && bestHits.Count > 0)
+                {
+                    if (bestSeries != ActiveSeriesIndex) SetActiveSeries(bestSeries, autoFit: false);
+                    if (!_additiveSelect) _selected.Clear();
+                    foreach (var i in bestHits) _selected.Add(i);
                     SelectionChanged?.Invoke();
                 }
             }
