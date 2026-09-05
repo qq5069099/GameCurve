@@ -16,6 +16,7 @@ public sealed class MainForm : Form
 
     private readonly ToolStrip _tool = new();
     private readonly ToolStripButton _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
+    private readonly ToolStripDropDownButton _openMenu = new("打开");
     private readonly ToolStripDropDownButton _layoutButton = new("布局");
     private readonly StatusStrip _status = new();
     private readonly ToolStripStatusLabel _statusLabel = new() { Text = "就绪" };
@@ -150,7 +151,8 @@ public sealed class MainForm : Form
     private void BuildUi()
     {
         _tool.GripStyle = ToolStripGripStyle.Hidden;
-        AddButton("打开", "选择并打开 .xlsx/.xlsm 工作簿", OnOpen);
+        _openMenu.DropDownOpening += (s, e) => RebuildOpenMenu();
+        _tool.Items.Add(_openMenu);
         AddButton("保存", "把当前改动写回 Excel 文件（Ctrl+S）", OnSave);
         AddButton("另存为", "复制一份并另存为新文件", OnSaveAs);
         AddButton("刷新", "重新从磁盘读取当前工作表", OnReload);
@@ -381,6 +383,7 @@ public sealed class MainForm : Form
             MessageBox.Show(this, "无法打开文件：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
+        _settings.LastFile = path;
         SetupWatcher(path);
         BuildSheetStrip();
         var best = FindBestDataColumn();
@@ -1328,6 +1331,43 @@ public sealed class MainForm : Form
         m.Click += (s, e) => onClick();
         return m;
     }
+
+    private void RebuildOpenMenu()
+    {
+        _openMenu.DropDownItems.Clear();
+        var pick = new ToolStripMenuItem("选择文件...");
+        pick.Click += (s, e) => OnOpen();
+        _openMenu.DropDownItems.Add(pick);
+        _openMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        string? folder = Path.GetDirectoryName(_wb?.Path ?? _settings.LastFile);
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+        {
+            _openMenu.DropDownItems.Add(new ToolStripMenuItem("（暂无历史文件夹）") { Enabled = false });
+            return;
+        }
+
+        var files = Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly)
+            .Where(IsExcelFile)
+            .OrderByDescending(f => File.GetLastWriteTimeUtc(f))
+            .ToList();
+        if (files.Count == 0)
+        {
+            _openMenu.DropDownItems.Add(new ToolStripMenuItem("（该文件夹暂无 Excel 文件）") { Enabled = false });
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            var item = new ToolStripMenuItem(Path.GetFileName(file)) { Tag = file };
+            item.Click += (s, e) => OpenFile((string)((ToolStripMenuItem)s!).Tag!);
+            _openMenu.DropDownItems.Add(item);
+        }
+    }
+
+    private static bool IsExcelFile(string path)
+        => path.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+           path.EndsWith(".xlsm", StringComparison.OrdinalIgnoreCase);
 
     private void AddButton(string text, string tooltip, Action onClick)
     {
