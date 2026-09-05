@@ -80,6 +80,8 @@ public sealed class MainForm : Form
     private bool _suppressRebuild;
     private bool _syncFromGrid;
     private bool _updatingGridSelection;
+    private int _preferredListIndex = -1;
+    private bool _preferredListChecked;
     private string _activeSheet = "";
     private string _autoFocusSheet = "";
     private int _autoFocusCol = -1;
@@ -321,7 +323,12 @@ public sealed class MainForm : Form
 
     private void BuildEvents()
     {
-        _colsChecked.ItemCheck += (s, e) => BeginInvoke((Action)OnSelectionChanged);
+        _colsChecked.ItemCheck += (s, e) =>
+        {
+            _preferredListIndex = e.Index;
+            _preferredListChecked = e.NewValue == CheckState.Checked;
+            BeginInvoke((Action)OnSelectionChanged);
+        };
         _xCombo.SelectedIndexChanged += (s, e) => OnSelectionChangedSafe();
         _stepUpDown.ValueChanged += (s, e) => _curve.KeyboardStep = (double)_stepUpDown.Value;
 
@@ -529,6 +536,7 @@ public sealed class MainForm : Form
         _suppressRebuild = true;
         try
         {
+            var preserved = _activeYColumn;
             _checkedCols = _colsChecked.CheckedItems.Cast<CurveColumnOption>().ToList();
             if (_checkedCols.Count == 0)
             {
@@ -540,16 +548,29 @@ public sealed class MainForm : Form
                 return;
             }
             _xColumn = _xCombo.SelectedIndex > 0 ? _xCombo.SelectedItem as CurveColumnOption : null;
-            _activeYColumn = _checkedCols[0];
+            int activeIndex = 0;
+            if (_preferredListIndex >= 0 && _preferredListChecked &&
+                _preferredListIndex < _colsChecked.Items.Count &&
+                _colsChecked.Items[_preferredListIndex] is CurveColumnOption preferred)
+            {
+                int pi = _checkedCols.FindIndex(o => ReferenceEquals(o, preferred));
+                if (pi >= 0) activeIndex = pi;
+            }
+            else if (preserved != null)
+            {
+                int pi = _checkedCols.FindIndex(o => IsSameCurveOption(o, preserved));
+                if (pi >= 0) activeIndex = pi;
+            }
+            _activeYColumn = _checkedCols[activeIndex];
 
             _series.Clear();
             for (int i = 0; i < _checkedCols.Count; i++)
-                _series.Add(BuildSeriesForOption(_checkedCols[i], i == 0));
+                _series.Add(BuildSeriesForOption(_checkedCols[i], i == activeIndex));
 
-            _curve.SetSeries(_series, 0);
+            _curve.SetSeries(_series, activeIndex);
             _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
             _curve.YAxisLabel = _activeYColumn.DisplayName;
-            SyncActiveColumnHighlight(0);
+            SyncActiveColumnHighlight(activeIndex);
 
             _committed.Clear(); _editing.Clear();
             _pendingUndoRows.Clear();
@@ -564,7 +585,12 @@ public sealed class MainForm : Form
             UpdateTitle();
             _curve.ClearSelection();
         }
-        finally { _suppressRebuild = false; }
+        finally
+        {
+            _preferredListIndex = -1;
+            _preferredListChecked = false;
+            _suppressRebuild = false;
+        }
     }
 
     private CurveSeriesView BuildSeriesForOption(CurveColumnOption opt, bool editable)
@@ -629,6 +655,13 @@ public sealed class MainForm : Form
         int idx = _colsChecked.Items.IndexOf(meta);
         if (idx >= 0) _colsChecked.SetSelected(idx, true);
     }
+
+    private static bool IsSameCurveOption(CurveColumnOption a, CurveColumnOption b)
+        => a.Column.ColumnIndex == b.Column.ColumnIndex &&
+           a.SubIndex == b.SubIndex &&
+           a.JsonIndex == b.JsonIndex &&
+           string.Equals(a.JsonId, b.JsonId, StringComparison.Ordinal) &&
+           a.IsJsonValue == b.IsJsonValue;
 
     private void HighlightEditableColumn()
     {
