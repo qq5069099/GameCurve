@@ -224,6 +224,19 @@ public sealed class CurveEditor : Control
         SelectionChanged?.Invoke();
     }
 
+    /// <summary>按物理行号批量选中当前编辑列的点。</summary>
+    public void SelectPointsByRows(IEnumerable<int> rows, bool additive = false)
+    {
+        var list = ActiveSeries?.Points;
+        if (list == null) return;
+        if (!additive) _selected.Clear();
+        foreach (var row in rows)
+            for (int i = 0; i < list.Count; i++)
+                if (list[i].RowNumber == row) { _selected.Add(i); break; }
+        Invalidate();
+        SelectionChanged?.Invoke();
+    }
+
     // ---------- 坐标变换 ----------
     private const int MarginL = 66, MarginR = 26, MarginT = 16, MarginB = 44;
     private int PlotW => Math.Max(2, ClientSize.Width - MarginL - MarginR);

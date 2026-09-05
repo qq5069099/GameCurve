@@ -78,6 +78,7 @@ public sealed class MainForm : Form
     private bool _gridAtRight;
     private bool _suppressRebuild;
     private bool _syncFromGrid;
+    private bool _updatingGridSelection;
     private string _activeSheet = "";
     private string _autoFocusSheet = "";
     private int _autoFocusCol = -1;
@@ -315,7 +316,7 @@ public sealed class MainForm : Form
         _curve.SelectionChanged += OnSelectionChangedUi;
         _curve.HoverChanged += s => _hoverLabel.Text = s;
         _grid.CellEndEdit += OnGridCellEdited;
-        _grid.CellClick += OnGridCellClicked;
+        _grid.SelectionChanged += OnGridSelectionChanged;
         _menu.Opening += (s, e) => BuildContextMenu();
 
         _autoSaveTimer.Tick += (s, e) => { _autoSaveTimer.Stop(); CommitPending(); };
@@ -535,6 +536,7 @@ public sealed class MainForm : Form
             _curve.SetSeries(_series, 0);
             _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
             _curve.YAxisLabel = _activeYColumn.DisplayName;
+            SyncActiveColumnHighlight(0);
 
             _committed.Clear(); _editing.Clear();
             _pendingUndoRows.Clear();
@@ -601,7 +603,17 @@ public sealed class MainForm : Form
             _editing[p.RowNumber] = (p.X, p.Y);
         }
         HighlightEditableColumn();
+        SyncActiveColumnHighlight(seriesIndex);
         UpdateStats();
+    }
+
+    /// <summary>把当前编辑列在“曲线列 (Y) 多选”里高亮选中，但不改变勾选状态。</summary>
+    private void SyncActiveColumnHighlight(int seriesIndex)
+    {
+        if (seriesIndex < 0 || seriesIndex >= _checkedCols.Count) return;
+        var meta = _checkedCols[seriesIndex];
+        int idx = _colsChecked.Items.IndexOf(meta);
+        if (idx >= 0) _colsChecked.SetSelected(idx, true);
     }
 
     private void HighlightEditableColumn()
@@ -863,17 +875,42 @@ public sealed class MainForm : Form
         _curve.Invalidate();
     }
 
-    private void OnGridCellClicked(object? sender, DataGridViewCellEventArgs e)
+    private void OnGridSelectionChanged(object? sender, EventArgs e)
     {
-        if (_snapshot == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
-        int col = e.ColumnIndex - 1;
-        if (col < 0) return;
-        int row = _snapshot.RowNumbers[e.RowIndex];
-        int si = _checkedCols.FindIndex(c => c.ColumnIndex == col);
+        // 由曲线联动表格或处于重建期间时不回写曲线
+        if (_updatingGridSelection || _syncFromGrid || _suppressRebuild) return;
+        if (_snapshot == null) return;
+
+        var cells = _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0 && c.ColumnIndex > 0)
+            .ToList();
+        if (cells.Count == 0) return;
+
+        // 取选中单元格所属第一列（去掉“行号”列）
+        int tableCol = cells[0].ColumnIndex - 1;
+
+        // 在“曲线列 (Y) 多选”完整列表里找到该列，高亮并滚动到可见区（不改变勾选）
+        var allItems = _colsChecked.Items.Cast<ColumnMeta>().ToList();
+        int listIdx = allItems.FindIndex(m => m.ColumnIndex == tableCol);
+        if (listIdx < 0) return;
+        if (_colsChecked.SelectedIndex != listIdx)
+            _colsChecked.SetSelected(listIdx, true);
+        _colsChecked.TopIndex = Math.Max(0, listIdx - 2);
+
+        if (_checkedCols.Count == 0) return;
+        // 若该列已是勾选的曲线列，则设为当前编辑列并同步选中点
+        int si = _checkedCols.FindIndex(cc => cc.ColumnIndex == tableCol);
         if (si < 0) return;
+        var rows = cells
+            .Where(c => c.ColumnIndex - 1 == tableCol)
+            .Select(c => _snapshot.RowNumbers[c.RowIndex])
+            .Distinct()
+            .ToList();
+        if (rows.Count == 0) return;
+
         _syncFromGrid = true;
         if (si != _curve.ActiveSeriesIndex) SetActiveSeries(si);
-        _curve.SelectPointByRow(row);
+        _curve.SelectPointsByRows(rows);
         _syncFromGrid = false;
     }
 
@@ -1294,16 +1331,24 @@ public sealed class MainForm : Form
                     if (col < _grid.Columns.Count)
                     {
                         // 只选中对应的单元格，而不是整行
-                        _grid.ClearSelection();
-                        foreach (var row in _curve.SelectedRows)
+                        _updatingGridSelection = true;
+                        try
                         {
-                            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
-                                _grid.Rows[gi].Cells[col].Selected = true;
+                            _grid.ClearSelection();
+                            foreach (var row in _curve.SelectedRows)
+                            {
+                                if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                                    _grid.Rows[gi].Cells[col].Selected = true;
+                            }
+                            if (_rowToGridIndex.TryGetValue(first.RowNumber, out var firstGi) && firstGi >= 0 && firstGi < _grid.Rows.Count)
+                            {
+                                _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, firstGi);
+                                _grid.CurrentCell = _grid.Rows[firstGi].Cells[col];
+                            }
                         }
-                        if (_rowToGridIndex.TryGetValue(first.RowNumber, out var firstGi) && firstGi >= 0 && firstGi < _grid.Rows.Count)
+                        finally
                         {
-                            _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, firstGi);
-                            _grid.CurrentCell = _grid.Rows[firstGi].Cells[col];
+                            _updatingGridSelection = false;
                         }
                     }
                 }
