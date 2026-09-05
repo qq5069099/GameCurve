@@ -225,6 +225,7 @@ public sealed class CurveEditor : Control
     private const int MarginL = 66, MarginR = 26, MarginT = 16, MarginB = 44;
     private int PlotW => Math.Max(2, ClientSize.Width - MarginL - MarginR);
     private int PlotH => Math.Max(2, ClientSize.Height - MarginT - MarginB);
+    private Rectangle PlotRect => new(MarginL, MarginT, PlotW, PlotH);
 
     private PointF WorldToScreen(double x, double y)
     {
@@ -306,7 +307,7 @@ public sealed class CurveEditor : Control
         if (!_hasView) AutoFitView();
 
         // 绘图区域背景
-        var plot = new Rectangle(MarginL, MarginT, PlotW, PlotH);
+        var plot = PlotRect;
         using (var bg = new SolidBrush(Color.White))
             g.FillRectangle(bg, plot);
 
@@ -482,6 +483,10 @@ public sealed class CurveEditor : Control
         if (e.Button == MouseButtons.Middle)
         {
             _drag = DragMode.Pan;
+            _lastPan = e.X;
+            _lastPanY = e.Y;
+            Capture = true;
+            Cursor = Cursors.SizeAll;
             return;
         }
         if (e.Button != MouseButtons.Left) return;
@@ -577,6 +582,8 @@ public sealed class CurveEditor : Control
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        Capture = false;
+        if (_drag == DragMode.Pan) Cursor = null;
         if (_drag == DragMode.Move && _dragged)
         {
             EditCommitted?.Invoke();

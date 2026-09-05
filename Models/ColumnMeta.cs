@@ -41,8 +41,11 @@ public sealed class ColumnMeta
     /// <summary>列内总数据行数。</summary>
     public int TotalRows { get; init; }
 
-    /// <summary>展示用的纯净列名。</summary>
-    public string DisplayName => IsEmpty ? $"（空列 {Letter}）" : $"{Label ?? Name} ({Letter})";
+    /// <summary>展示列名：保留表头原始文本，不做简化。</summary>
+    public string DisplayName =>
+        IsEmpty || string.IsNullOrWhiteSpace(HeaderRaw)
+            ? $"（空列 {Letter}）"
+            : HeaderRaw.Trim();
 
     public override string ToString() => Name == "" ? Letter : DisplayName;
 }

@@ -8,7 +8,7 @@ namespace GameCurve.Ui;
 public sealed class MainForm : Form
 {
     private const int LeftPanelWidth = 165;   // 左侧功能面板宽度
-    private const int RightPanelWidth = 250;  // 可完整容纳编辑/批量/统计控件
+    private const int RightPanelWidth = 260;  // 可完整容纳编辑/批量/统计控件
 
     private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
     private readonly DataGridView _grid = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false };
@@ -150,7 +150,7 @@ public sealed class MainForm : Form
     {
         _tool.GripStyle = ToolStripGripStyle.Hidden;
         AddButton("打开", "选择并打开 .xlsx/.xlsm 工作簿", OnOpen);
-        AddButton("保存", "把当前改动写回 Excel 文件", OnSave);
+        AddButton("保存", "把当前改动写回 Excel 文件（Ctrl+S）", OnSave);
         AddButton("另存为", "复制一份并另存为新文件", OnSaveAs);
         AddButton("刷新", "重新从磁盘读取当前工作表", OnReload);
         _tool.Items.Add(new ToolStripSeparator());
@@ -254,6 +254,21 @@ public sealed class MainForm : Form
         _chartArea.Controls.Add(_curve, 1, 0);
         _chartArea.Controls.Add(_rightPanel, 2, 0);
 
+        // 面板宽度变化时同步内部控件宽度，避免调窄后出现横向滚动条
+        static void FitPanelWidth(Panel p)
+        {
+            int w = Math.Max(2, p.ClientSize.Width - 16);
+            foreach (Control c in p.Controls)
+            {
+                if (c.AutoSize) continue;
+                c.Width = w;
+            }
+        }
+        _leftPanel.Resize += (s, e) => FitPanelWidth(_leftPanel);
+        _leftPanel.ClientSizeChanged += (s, e) => FitPanelWidth(_leftPanel);
+        _rightPanel.Resize += (s, e) => FitPanelWidth(_rightPanel);
+        _rightPanel.ClientSizeChanged += (s, e) => FitPanelWidth(_rightPanel);
+
         // 数据表格 + 底部工作表标签（作为一个整体，独占下方整行）
         _gridPane = new Panel { Dock = DockStyle.Fill };
         _gridPane.Controls.Add(_grid);
@@ -310,7 +325,8 @@ public sealed class MainForm : Form
         KeyPreview = true;
         KeyDown += (s, e) =>
         {
-            if (e.Control && e.KeyCode == Keys.Z) { Undo(); e.Handled = true; }
+            if (e.Control && e.KeyCode == Keys.S) { OnSave(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.Z) { Undo(); e.Handled = true; }
             else if (e.Control && e.KeyCode == Keys.Y) { Redo(); e.Handled = true; }
         };
     }
@@ -363,6 +379,14 @@ public sealed class MainForm : Form
         UpdateTitle();
     }
 
+    /// <summary>判断是否为“序号 / 主键”列，默认选中时应跳过。</summary>
+    private static bool IsOrdinalColumn(ColumnMeta c)
+    {
+        if (c.Name.Equals("ID", StringComparison.OrdinalIgnoreCase)) return true;
+        string t = $"{c.Name} {c.Label} {c.HeaderRaw}";
+        return t.Contains("序号") || t.Contains("编号");
+    }
+
     private (string Sheet, ColumnMeta Col)? FindBestDataColumn()
     {
         if (_wb == null) return null;
@@ -373,7 +397,7 @@ public sealed class MainForm : Form
             try { sn = _wb.LoadSheet(sheet); } catch { continue; }
             foreach (var col in sn.Columns.Where(c => c.IsNumericScalar))
             {
-                if (col.Name.Equals("ID", StringComparison.OrdinalIgnoreCase) || col.Name.Contains("序号")) continue;
+                if (IsOrdinalColumn(col)) continue;
                 int cnt = sn.GetNumericColumn(col.ColumnIndex).Count;
                 if (best == null || cnt > best.Value.Count) best = (sheet, col, cnt);
             }
@@ -463,7 +487,16 @@ public sealed class MainForm : Form
         foreach (var c in nums) _colsChecked.Items.Add(c);
         if (nums.Count > 0)
         {
-            int focus = _autoFocusCol >= 0 ? nums.FindIndex(c => c.ColumnIndex == _autoFocusCol) : 0;
+            int focus = -1;
+            // 优先使用进入时定位的数据列；若它恰好是序号列，则在多列时跳过
+            if (_autoFocusCol >= 0)
+            {
+                int ai = nums.FindIndex(c => c.ColumnIndex == _autoFocusCol);
+                if (ai >= 0 && (nums.Count < 2 || !IsOrdinalColumn(nums[ai]))) focus = ai;
+            }
+            // 两列及以上时默认跳过序号/主键列，选第一个真正的数据列
+            if (focus < 0 && nums.Count >= 2)
+                focus = nums.FindIndex(c => !IsOrdinalColumn(c));
             if (focus < 0) focus = 0;
             for (int i = 0; i < nums.Count; i++) _colsChecked.SetItemChecked(i, i == focus);
         }
@@ -709,7 +742,14 @@ public sealed class MainForm : Form
     {
         _grid.Columns.Clear();
         if (_snapshot == null) { _grid.Rows.Clear(); return; }
-        var header = new DataGridViewTextBoxColumn { HeaderText = "行号", Name = "行号", ReadOnly = true, Width = 60 };
+        var header = new DataGridViewTextBoxColumn
+        {
+            HeaderText = "行号",
+            Name = "行号",
+            ReadOnly = true,
+            Width = 60,
+            DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleCenter }
+        };
         _grid.Columns.Add(header);
         foreach (var col in _snapshot.Columns)
         {
@@ -720,6 +760,14 @@ public sealed class MainForm : Form
                 ReadOnly = false,
                 SortMode = DataGridViewColumnSortMode.NotSortable
             };
+            int ci = col.ColumnIndex;
+            var align = ci >= 0 && ci < _snapshot.ColumnAlignments.Count
+                ? _snapshot.ColumnAlignments[ci]
+                : HorizontalAlign.Default;
+            // 默认对齐：数值列按 Excel 惯例右对齐，文本列左对齐
+            if (align == HorizontalAlign.Default)
+                align = col.IsNumericScalar ? HorizontalAlign.Right : HorizontalAlign.Left;
+            c.DefaultCellStyle.Alignment = MapAlign(align);
             if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.ColumnIndex)
                 c.DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 235);
             _grid.Columns.Add(c);
@@ -1194,6 +1242,14 @@ public sealed class MainForm : Form
         b.Click += (s, e) => onClick();
         return b;
     }
+
+    private static DataGridViewContentAlignment MapAlign(HorizontalAlign a) => a switch
+    {
+        HorizontalAlign.Center => DataGridViewContentAlignment.MiddleCenter,
+        HorizontalAlign.Right => DataGridViewContentAlignment.MiddleRight,
+        _ => DataGridViewContentAlignment.MiddleLeft
+    };
+
     private static ToolStripMenuItem MakeMenu(string text, string tooltip, Action onClick, bool check)
     {
         var m = new ToolStripMenuItem(text) { ToolTipText = tooltip, Checked = check, CheckOnClick = false };
@@ -1220,7 +1276,7 @@ public sealed class MainForm : Form
         Tip(_clampMax, "钳制最大值");
         Tip(_randUpDown, "随机扰动幅度（±，配合“随机扰动”按钮）");
         Tip(_statLabel, "当前编辑列的统计信息（最大/平均/总和/标准差等）");
-        Tip(_curve, "单击选点 · Ctrl 加选 · 拖拽移动 · 空白拖框选 · Ctrl+A 全选 · ↑↓←→微调 · 滚轮缩放 · 右键菜单 · 双击自适应");
+        Tip(_curve, "单击选点 · Ctrl 加选 · 拖拽移动 · 空白拖框选 · Ctrl+A 全选 · ↑↓←→微调 · 滚轮缩放 · 中键平移 · 右键菜单 · 双击自适应");
         Tip(_grid, "黄色列为当前可编辑列：双击/选中后输入数字回车，曲线即时更新；其余列只读");
     }
 

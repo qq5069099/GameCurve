@@ -2,6 +2,15 @@ using GameCurve.Excel;
 
 namespace GameCurve.Models;
 
+/// <summary>单元格水平对齐方式（来自 Excel 单元格样式）。</summary>
+public enum HorizontalAlign
+{
+    Default = 0,
+    Left = 1,
+    Center = 2,
+    Right = 3
+}
+
 /// <summary>
 /// 某个工作表读入内存后的快照：所有单元格原始文本 + 列元信息 + 数据行号。
 /// </summary>
@@ -23,6 +32,9 @@ public sealed class SheetSnapshot
 
     /// <summary>每行对应的物理行号（HeaderRow+1 起）。</summary>
     public List<int> RowNumbers { get; } = new();
+
+    /// <summary>每列的水平对齐方式（按列索引，长度同 ColumnCount）。</summary>
+    public List<HorizontalAlign> ColumnAlignments { get; } = new();
 
     public int DataRowCount => Grid.Count;
 

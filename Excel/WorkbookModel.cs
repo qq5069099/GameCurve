@@ -53,6 +53,21 @@ public sealed class WorkbookModel : IDisposable
         var wsPart = GetWorksheetPart(wbPart, sheetName);
         var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
 
+        // 读取单元格样式表，用于还原原始水平对齐
+        var cellFormats = wbPart.WorkbookStylesPart?.Stylesheet?.CellFormats?.Elements<CellFormat>().ToList();
+        static HorizontalAlign? AlignOf(Cell cell, List<CellFormat>? formats)
+        {
+            if (formats == null) return null;
+            uint si = cell.StyleIndex?.Value ?? 0;
+            if (si >= formats.Count) return null;
+            var hv = formats[(int)si].Alignment?.Horizontal?.Value;
+            if (hv == HorizontalAlignmentValues.Center || hv == HorizontalAlignmentValues.CenterContinuous)
+                return HorizontalAlign.Center;
+            if (hv == HorizontalAlignmentValues.Left) return HorizontalAlign.Left;
+            if (hv == HorizontalAlignmentValues.Right) return HorizontalAlign.Right;
+            return null;
+        }
+
         // 收集所有行
         var rows = new SortedDictionary<int, List<Cell>>();
         int maxRow = 0, maxCol = 0;
@@ -126,6 +141,7 @@ public sealed class WorkbookModel : IDisposable
         }
 
         // 建立网格
+        var alignVotes = new Dictionary<int, Dictionary<HorizontalAlign, int>>();
         for (int r = headerRow + 1; r <= maxRow; r++)
         {
             var rowCells = rows.TryGetValue(r, out var rc) ? rc : new List<Cell>();
@@ -134,10 +150,27 @@ public sealed class WorkbookModel : IDisposable
             {
                 int colIdx = CellHelper.GetColumnIndex(cell);
                 if (colIdx >= 0 && colIdx < maxCol)
+                {
                     line[colIdx] = CellHelper.GetCellValue(cell);
+                    var a = AlignOf(cell, cellFormats);
+                    if (a != null)
+                    {
+                        if (!alignVotes.TryGetValue(colIdx, out var votes)) { votes = new(); alignVotes[colIdx] = votes; }
+                        votes[a.Value] = votes.GetValueOrDefault(a.Value) + 1;
+                    }
+                }
             }
             snap.Grid.Add(line);
             snap.RowNumbers.Add(r);
+        }
+
+        // 每列取出现次数最多的对齐方式，作为整列默认显示
+        for (int c = 0; c < maxCol; c++)
+        {
+            var align = HorizontalAlign.Default;
+            if (alignVotes.TryGetValue(c, out var votes) && votes.Count > 0)
+                align = votes.OrderByDescending(kv => kv.Value).First().Key;
+            snap.ColumnAlignments.Add(align);
         }
 
         _cache[sheetName] = snap;
