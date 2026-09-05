@@ -1473,8 +1473,14 @@ public sealed class MainForm : Form
     }
 
     private static bool IsExcelFile(string path)
-        => path.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase) ||
-           path.EndsWith(".xlsm", StringComparison.OrdinalIgnoreCase);
+    {
+        string name = Path.GetFileName(path);
+        if (name.Contains("~$", StringComparison.Ordinal) ||
+            name.Contains("111", StringComparison.Ordinal))
+            return false;
+        return name.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".xlsm", StringComparison.OrdinalIgnoreCase);
+    }
 
     private void AddButton(string text, string tooltip, Action onClick)
     {
