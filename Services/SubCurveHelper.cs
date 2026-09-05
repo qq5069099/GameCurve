@@ -34,15 +34,24 @@ public static class SubCurveHelper
 
     public static bool IsArrayCol(ColumnMeta col)
     {
+        if (IsRangeColumn(col)) return true;
         if (string.IsNullOrWhiteSpace(col.Type)) return false;
         var m = ArrayType.Match(col.Type!);
         return m.Success && NumericArrayTypes.Contains(m.Groups["type"].Value);
     }
 
+    /// <summary>识别 &lt;long&gt;.range / &lt;float&gt;.range 之类的区域列。</summary>
+    public static bool IsRangeColumn(ColumnMeta col)
+        => !string.IsNullOrWhiteSpace(col.HeaderRaw)
+            && col.HeaderRaw.Contains(".range", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(col.Type)
+            && NumericArrayTypes.Contains(col.Type);
+
     /// <summary>判断数组列的元素基础类型是否为整型（int/long 等）。</summary>
     public static bool IsIntegerArray(ColumnMeta col)
     {
         if (string.IsNullOrWhiteSpace(col.Type)) return false;
+        if (IsRangeColumn(col)) return IntegerArrayTypes.Contains(col.Type);
         var m = ArrayType.Match(col.Type!);
         return m.Success && IntegerArrayTypes.Contains(m.Groups["type"].Value);
     }
@@ -64,15 +73,7 @@ public static class SubCurveHelper
         var list = new List<CurveColumnOption>();
         foreach (var col in snap.Columns)
         {
-            if (col.IsNumericScalar)
-            {
-                list.Add(new CurveColumnOption
-                {
-                    Column = col,
-                    DisplayName = col.DisplayName
-                });
-            }
-            else if (IsArrayCol(col))
+            if (IsArrayCol(col))
             {
                 // 长度不固定，按整列实际数据动态扫描
                 int n = ScanArrayCount(snap, col);
@@ -83,6 +84,14 @@ public static class SubCurveHelper
                         SubIndex = i,
                         DisplayName = $"{ShortName(col)}[{i}]"
                     });
+            }
+            else if (col.IsNumericScalar)
+            {
+                list.Add(new CurveColumnOption
+                {
+                    Column = col,
+                    DisplayName = col.DisplayName
+                });
             }
             else if (IsJsonCol(col))
             {
