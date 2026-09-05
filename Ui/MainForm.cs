@@ -295,6 +295,7 @@ public sealed class MainForm : Form
         _grid.RowHeadersVisible = true;
         _grid.EditMode = DataGridViewEditMode.EditOnEnter;
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.DisplayedCells;
+        _grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
         _grid.BackgroundColor = Color.White;
 
         _menu.ShowImageMargin = false;
@@ -1287,16 +1288,22 @@ public sealed class MainForm : Form
                 _valUpDown.Value = Math.Clamp((decimal)first.Y, _valUpDown.Minimum, _valUpDown.Maximum);
                 // 来自表格点击时不再滚动/定位（避免跳动）
                 if (_syncFromGrid) return;
-                if (_rowToGridIndex.TryGetValue(first.RowNumber, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                if (_activeYColumn != null)
                 {
-                    _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, gi);
-                    if (_activeYColumn != null)
+                    int col = _activeYColumn.ColumnIndex + 1;
+                    if (col < _grid.Columns.Count)
                     {
-                        int col = _activeYColumn.ColumnIndex + 1;
-                        if (col < _grid.Columns.Count)
+                        // 只选中对应的单元格，而不是整行
+                        _grid.ClearSelection();
+                        foreach (var row in _curve.SelectedRows)
                         {
-                            _grid.CurrentCell = _grid.Rows[gi].Cells[col];
-                            _grid.Rows[gi].Selected = true;
+                            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                                _grid.Rows[gi].Cells[col].Selected = true;
+                        }
+                        if (_rowToGridIndex.TryGetValue(first.RowNumber, out var firstGi) && firstGi >= 0 && firstGi < _grid.Rows.Count)
+                        {
+                            _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, firstGi);
+                            _grid.CurrentCell = _grid.Rows[firstGi].Cells[col];
                         }
                     }
                 }

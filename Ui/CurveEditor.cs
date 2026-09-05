@@ -34,6 +34,7 @@ public sealed class CurveEditor : Control
     private PointF _dragStartWorld;
     private readonly Dictionary<int, (double X, double Y)> _dragInitial = new();
     private bool _dragged;
+    private bool _spaceDown;
     private Point _mouseDown;
     private int _hoverIndex = -1;
     private bool _additiveSelect;
@@ -493,6 +494,20 @@ public sealed class CurveEditor : Control
         }
         if (e.Button != MouseButtons.Left) return;
 
+        // 按住空格时，鼠标按在画布任意位置都拖拽所有选中点（不用精准点中）
+        if (_spaceDown && _selected.Count > 0 && ActiveSeries != null)
+        {
+            _grabIndex = _selected.First();
+            _drag = DragMode.Move;
+            _dragged = false;
+            _dragInitial.Clear();
+            var list = ActiveSeries.Points;
+            for (int i = 0; i < list.Count; i++) _dragInitial[i] = (list[i].X, list[i].Y);
+            _dragStartWorld = new PointF(e.X, e.Y);
+            Invalidate();
+            return;
+        }
+
         int hit = HitTest(e.Location);
         bool ctrl = (ModifierKeys & Keys.Control) != 0;
         if (hit >= 0)
@@ -647,6 +662,13 @@ public sealed class CurveEditor : Control
         }
     }
 
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        base.OnMouseEnter(e);
+        // 鼠标进入画布即让画布获得焦点，表格等其他控件自然失去焦点
+        if (!ContainsFocus) Focus();
+    }
+
     protected override void OnDoubleClick(EventArgs e)
     {
         base.OnDoubleClick(e);
@@ -659,6 +681,7 @@ public sealed class CurveEditor : Control
         {
             case Keys.Up: case Keys.Down: case Keys.Left: case Keys.Right:
             case Keys.Home: case Keys.End: case Keys.PageUp: case Keys.PageDown:
+            case Keys.Space:
                 return true;
         }
         return base.IsInputKey(keyData);
@@ -667,6 +690,7 @@ public sealed class CurveEditor : Control
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Space) _spaceDown = true;
         if (e.Control && e.KeyCode == Keys.A)
         {
             SelectAll();
@@ -707,6 +731,12 @@ public sealed class CurveEditor : Control
             EditCommitted?.Invoke();
         }
         e.Handled = changed;
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        base.OnKeyUp(e);
+        if (e.KeyCode == Keys.Space) _spaceDown = false;
     }
 
     private void UpdateHover(Point location)
