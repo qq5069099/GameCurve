@@ -45,6 +45,7 @@ public sealed class CurveEditor : Control
     public event Action? SelectionChanged;
     public event Action<string>? HoverChanged;
 
+    // 临时诊断
     public bool ShowSpline { get; set; } = true;
     public bool ShowGrid { get; set; } = true;
     public bool ShowPoints { get; set; } = true;
@@ -245,9 +246,18 @@ public sealed class CurveEditor : Control
 
     private PointF WorldToScreen(double x, double y)
     {
-        float sx = MarginL + (float)((x - _xMin) / Math.Max(1e-12, _xMax - _xMin) * PlotW);
-        float sy = MarginT + (float)((1 - (y - _yMin) / Math.Max(1e-12, _yMax - _yMin)) * PlotH);
-        return new PointF(sx, sy);
+        double dx = (x - _xMin) / Math.Max(1e-12, _xMax - _xMin) * PlotW;
+        double dy = (y - _yMin) / Math.Max(1e-12, _yMax - _yMin);
+        double sx = MarginL + dx;
+        double sy = MarginT + (1 - dy) * PlotH;
+        // NaN/Infinity 兜底
+        if (!double.IsFinite(sx)) sx = MarginL;
+        if (!double.IsFinite(sy)) sy = MarginT;
+        // 远离视图的点钳制到可控范围，避免 GDI 将超大坐标转 int 时溢出
+        const double Limit = 1e6;
+        sx = Math.Clamp(sx, -Limit, Limit);
+        sy = Math.Clamp(sy, -Limit, Limit);
+        return new PointF((float)sx, (float)sy);
     }
 
     private (double X, double Y) ScreenToWorld(PointF p)

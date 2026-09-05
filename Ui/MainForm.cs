@@ -64,9 +64,9 @@ public sealed class MainForm : Form
 
     private WorkbookModel? _wb;
     private SheetSnapshot? _snapshot;
-    private List<ColumnMeta> _checkedCols = new();
-    private ColumnMeta? _xColumn;
-    private ColumnMeta? _activeYColumn;
+    private List<CurveColumnOption> _checkedCols = new();
+    private CurveColumnOption? _xColumn;
+    private CurveColumnOption? _activeYColumn;
     private readonly List<CurveSeriesView> _series = new();
 
     private readonly Dictionary<int, (double X, double Y)> _committed = new();
@@ -482,32 +482,33 @@ public sealed class MainForm : Form
         catch (Exception ex) { _statusLabel.Text = "读取工作表失败：" + ex.Message; return; }
 
         var nums = _snapshot.Columns.Where(c => c.IsNumericScalar).ToList();
+        var curveOptions = SubCurveHelper.BuildOptions(_snapshot);
         _colsChecked.Items.Clear();
-        foreach (var c in nums) _colsChecked.Items.Add(c);
-        if (nums.Count > 0)
+        foreach (var o in curveOptions) _colsChecked.Items.Add(o);
+        if (curveOptions.Count > 0)
         {
             int focus = -1;
             // 优先使用进入时定位的数据列；若它恰好是序号列，则在多列时跳过
             if (_autoFocusCol >= 0)
             {
-                int ai = nums.FindIndex(c => c.ColumnIndex == _autoFocusCol);
-                if (ai >= 0 && (nums.Count < 2 || !IsOrdinalColumn(nums[ai]))) focus = ai;
+                int ai = curveOptions.FindIndex(o => o.Column.ColumnIndex == _autoFocusCol);
+                if (ai >= 0 && (curveOptions.Count < 2 || !IsOrdinalColumn(curveOptions[ai].Column))) focus = ai;
             }
             // 两列及以上时默认跳过序号/主键列，选第一个真正的数据列
-            if (focus < 0 && nums.Count >= 2)
-                focus = nums.FindIndex(c => !IsOrdinalColumn(c));
+            if (focus < 0 && curveOptions.Count >= 2)
+                focus = curveOptions.FindIndex(o => !IsOrdinalColumn(o.Column));
             if (focus < 0) focus = 0;
-            for (int i = 0; i < nums.Count; i++) _colsChecked.SetItemChecked(i, i == focus);
+            for (int i = 0; i < curveOptions.Count; i++) _colsChecked.SetItemChecked(i, i == focus);
         }
         _autoFocusCol = -1;
 
         _xCombo.Items.Clear();
         _xCombo.Items.Add("行号");
-        foreach (var c in nums) _xCombo.Items.Add(c);
+        foreach (var o in curveOptions) _xCombo.Items.Add(o);
         _xCombo.SelectedIndex = 0;
 
         RebuildFromSelection();
-        _statusLabel.Text = $"已加载 [{_activeSheet}]：{_snapshot.DataRowCount} 行 × {_snapshot.ColumnCount} 列，数值列 {nums.Count} 个";
+        _statusLabel.Text = $"已加载 [{_activeSheet}]：{_snapshot.DataRowCount} 行 × {_snapshot.ColumnCount} 列，曲线子列 {curveOptions.Count} 条";
     }
 
     private void RebuildFromSelection()
@@ -516,7 +517,7 @@ public sealed class MainForm : Form
         _suppressRebuild = true;
         try
         {
-            _checkedCols = _colsChecked.CheckedItems.Cast<ColumnMeta>().ToList();
+            _checkedCols = _colsChecked.CheckedItems.Cast<CurveColumnOption>().ToList();
             if (_checkedCols.Count == 0)
             {
                 _series.Clear();
@@ -526,12 +527,12 @@ public sealed class MainForm : Form
                 UpdateStats();
                 return;
             }
-            _xColumn = _xCombo.SelectedIndex > 0 ? _xCombo.SelectedItem as ColumnMeta : null;
+            _xColumn = _xCombo.SelectedIndex > 0 ? _xCombo.SelectedItem as CurveColumnOption : null;
             _activeYColumn = _checkedCols[0];
 
             _series.Clear();
             for (int i = 0; i < _checkedCols.Count; i++)
-                _series.Add(BuildSeriesForColumn(_checkedCols[i], i == 0));
+                _series.Add(BuildSeriesForOption(_checkedCols[i], i == 0));
 
             _curve.SetSeries(_series, 0);
             _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
@@ -554,17 +555,18 @@ public sealed class MainForm : Form
         finally { _suppressRebuild = false; }
     }
 
-    private CurveSeriesView BuildSeriesForColumn(ColumnMeta col, bool editable)
+    private CurveSeriesView BuildSeriesForOption(CurveColumnOption opt, bool editable)
     {
         var points = new List<CurvePoint>();
-        foreach (var (row, val) in _snapshot!.GetNumericColumn(col.ColumnIndex))
+        var snap = _snapshot!;
+        for (int gi = 0; gi < snap.RowNumbers.Count; gi++)
         {
+            int row = snap.RowNumbers[gi];
+            if (!SubCurveHelper.TryReadValue(snap, opt, gi, out var val)) continue;
             double x = row; bool xEditable = false;
             if (_xColumn != null)
             {
-                int gi = _snapshot.RowNumbers.IndexOf(row);
-                if (gi >= 0 && _xColumn.ColumnIndex < _snapshot.Grid[gi].Length &&
-                    CellHelper.TryParseDouble(_snapshot.Grid[gi][_xColumn.ColumnIndex], out var xv))
+                if (SubCurveHelper.TryReadValue(snap, _xColumn, gi, out var xv))
                 { x = xv; xEditable = true; }
                 else continue;
             }
@@ -572,7 +574,7 @@ public sealed class MainForm : Form
         }
         var view = new CurveSeriesView
         {
-            Name = col.DisplayName,
+            Name = opt.DisplayName,
             Color = CurveEditor.Palette[_series.Count % CurveEditor.Palette.Length],
             IsEditable = editable
         };
@@ -618,7 +620,7 @@ public sealed class MainForm : Form
 
     private void HighlightEditableColumn()
     {
-        int activeCol = _activeYColumn?.ColumnIndex ?? -1;
+        int activeCol = _activeYColumn?.Column.ColumnIndex ?? -1;
         for (int i = 0; i < _grid.Columns.Count; i++)
         {
             var col = _grid.Columns[i];
@@ -638,13 +640,23 @@ public sealed class MainForm : Form
             _editing[row] = (p.X, p.Y);
             if (_activeYColumn != null)
             {
-                _dirtyCells.Add((_activeYColumn.ColumnIndex, row));
-                UpdateSnapshotCell(row, _activeYColumn.ColumnIndex, FormatCellValue(p.Y, _activeYColumn.IsInteger));
+                int col = _activeYColumn.Column.ColumnIndex;
+                _dirtyCells.Add((col, row));
+                if (_activeYColumn.IsSubCurve)
+                {
+                    string oldRaw = CellText(col, row);
+                    UpdateSnapshotCell(row, col, SubCurveHelper.SetValue(oldRaw, _activeYColumn, p.Y));
+                }
+                else
+                    UpdateSnapshotCell(row, col, FormatCellValue(p.Y, _activeYColumn.IsInteger));
             }
             if (_xColumn != null && p.XEditable)
             {
-                _dirtyCells.Add((_xColumn.ColumnIndex, row));
-                UpdateSnapshotCell(row, _xColumn.ColumnIndex, FormatCellValue(p.X, _xColumn.IsInteger));
+                int xCol = _xColumn.Column.ColumnIndex;
+                _dirtyCells.Add((xCol, row));
+                UpdateSnapshotCell(row, xCol, _xColumn.IsSubCurve
+                    ? SubCurveHelper.SetValue(CellText(xCol, row), _xColumn, p.X)
+                    : FormatCellValue(p.X, _xColumn.IsInteger));
             }
             _pendingUndoRows.Add(row);
         }
@@ -669,10 +681,10 @@ public sealed class MainForm : Form
             if (!_editing.TryGetValue(row, out var cur)) continue;
             var old = _committed.TryGetValue(row, out var o) ? o : cur;
             if (Math.Abs(old.X - cur.X) < 1e-12 && Math.Abs(old.Y - cur.Y) < 1e-12) continue;
-            if (_activeYColumn != null)
-                items.Add((_activeYColumn.ColumnIndex, row, FormatCellValue(old.Y, _activeYColumn.IsInteger), FormatCellValue(cur.Y, _activeYColumn.IsInteger)));
-            if (_xColumn != null && TryGetPoint(row, out var p) && p.XEditable && Math.Abs(old.X - cur.X) > 1e-12)
-                items.Add((_xColumn.ColumnIndex, row, FormatCellValue(old.X, _xColumn.IsInteger), FormatCellValue(cur.X, _xColumn.IsInteger)));
+            if (_activeYColumn != null && !_activeYColumn.IsSubCurve)
+                items.Add((_activeYColumn.Column.ColumnIndex, row, FormatCellValue(old.Y, _activeYColumn.IsInteger), FormatCellValue(cur.Y, _activeYColumn.IsInteger)));
+            if (_xColumn != null && !_xColumn.IsSubCurve && TryGetPoint(row, out var p) && p.XEditable && Math.Abs(old.X - cur.X) > 1e-12)
+                items.Add((_xColumn.Column.ColumnIndex, row, FormatCellValue(old.X, _xColumn.IsInteger), FormatCellValue(cur.X, _xColumn.IsInteger)));
             _committed[row] = cur;
         }
         if (items.Count > 0) { _undo.Add(new EditCmd(items)); _redo.Clear(); }
@@ -778,7 +790,7 @@ public sealed class MainForm : Form
             if (align == HorizontalAlign.Default)
                 align = col.IsNumericScalar ? HorizontalAlign.Right : HorizontalAlign.Left;
             c.DefaultCellStyle.Alignment = MapAlign(align);
-            if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.ColumnIndex)
+            if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.Column.ColumnIndex)
                 c.DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 235);
             _grid.Columns.Add(c);
         }
@@ -802,17 +814,23 @@ public sealed class MainForm : Form
     private void UpdateGridCells(IReadOnlyList<int> rows)
     {
         if (_snapshot == null || _activeYColumn == null) return;
-        int yGridCol = _activeYColumn.ColumnIndex + 1;
+        int yCol = _activeYColumn.Column.ColumnIndex;
+        int yGridCol = yCol + 1;
         foreach (var row in rows)
         {
             if (!_rowToGridIndex.TryGetValue(row, out var gi) || gi >= _snapshot.Grid.Count) continue;
             if (_editing.TryGetValue(row, out var v))
             {
-                _grid.Rows[gi].Cells[yGridCol].Value = FormatCellValue(v.Y, _activeYColumn.IsInteger);
+                _grid.Rows[gi].Cells[yGridCol].Value = _activeYColumn.IsSubCurve
+                    ? CellText(yCol, row)
+                    : FormatCellValue(v.Y, _activeYColumn.IsInteger);
                 if (_xColumn != null)
                 {
-                    int xGridCol = _xColumn.ColumnIndex + 1;
-                    _grid.Rows[gi].Cells[xGridCol].Value = FormatCellValue(v.X, _xColumn.IsInteger);
+                    int xCol = _xColumn.Column.ColumnIndex;
+                    int xGridCol = xCol + 1;
+                    _grid.Rows[gi].Cells[xGridCol].Value = _xColumn.IsSubCurve
+                        ? CellText(xCol, row)
+                        : FormatCellValue(v.X, _xColumn.IsInteger);
                 }
             }
         }
@@ -833,7 +851,7 @@ public sealed class MainForm : Form
         ApplyPlottedCellChange(col, row, text);
 
         // 当前编辑列（可拖动那条）的编辑基线同步
-        if (_activeYColumn != null && col == _activeYColumn.ColumnIndex)
+        if (_activeYColumn != null && col == _activeYColumn.Column.ColumnIndex && !_activeYColumn.IsSubCurve)
         {
             if (CellHelper.TryParseDouble(text, out var y))
             {
@@ -856,14 +874,19 @@ public sealed class MainForm : Form
 
     private void ApplyPlottedCellChange(int col, int row, string text)
     {
-        int si = _checkedCols.FindIndex(c => c.ColumnIndex == col);
+        int si = _checkedCols.FindIndex(c => c.Column.ColumnIndex == col);
         if (si < 0) return;
+        // 子曲线列整格为数组/JSON，直接编辑按非标量处理，避免误删曲线点
+        if (_checkedCols[si].IsSubCurve && !CellHelper.TryParseDouble(text, out _))
+            return;
         if (CellHelper.TryParseDouble(text, out var y))
         {
             double x = row; bool xEditable = false;
-            if (_xColumn != null)
+            if (_xColumn != null &&
+                _rowToGridIndex.TryGetValue(row, out var xgi) &&
+                SubCurveHelper.TryReadValue(_snapshot!, _xColumn, xgi, out var xv))
             {
-                x = SnapshotValue(row, _xColumn.ColumnIndex, row);
+                x = xv;
                 xEditable = true;
             }
             _curve.SetSeriesPoint(si, row, x, y, xEditable);
@@ -890,8 +913,8 @@ public sealed class MainForm : Form
         int tableCol = cells[0].ColumnIndex - 1;
 
         // 在“曲线列 (Y) 多选”完整列表里找到该列，高亮并滚动到可见区（不改变勾选）
-        var allItems = _colsChecked.Items.Cast<ColumnMeta>().ToList();
-        int listIdx = allItems.FindIndex(m => m.ColumnIndex == tableCol);
+        var allItems = _colsChecked.Items.Cast<CurveColumnOption>().ToList();
+        int listIdx = allItems.FindIndex(m => m.Column.ColumnIndex == tableCol);
         if (listIdx < 0) return;
         if (_colsChecked.SelectedIndex != listIdx)
             _colsChecked.SetSelected(listIdx, true);
@@ -899,7 +922,7 @@ public sealed class MainForm : Form
 
         if (_checkedCols.Count == 0) return;
         // 若该列已是勾选的曲线列，则设为当前编辑列并同步选中点
-        int si = _checkedCols.FindIndex(cc => cc.ColumnIndex == tableCol);
+        int si = _checkedCols.FindIndex(cc => cc.Column.ColumnIndex == tableCol);
         if (si < 0) return;
         var rows = cells
             .Where(c => c.ColumnIndex - 1 == tableCol)
@@ -974,7 +997,7 @@ public sealed class MainForm : Form
             string val = toOld ? o : n;
             UpdateSnapshotCell(row, col, val);
             ApplyPlottedCellChange(col, row, val);
-            if (_activeYColumn != null && col == _activeYColumn.ColumnIndex)
+            if (_activeYColumn != null && col == _activeYColumn.Column.ColumnIndex)
             {
                 if (CellHelper.TryParseDouble(val, out var y))
                 {
@@ -1327,7 +1350,7 @@ public sealed class MainForm : Form
                 if (_syncFromGrid) return;
                 if (_activeYColumn != null)
                 {
-                    int col = _activeYColumn.ColumnIndex + 1;
+                    int col = _activeYColumn.Column.ColumnIndex + 1;
                     if (col < _grid.Columns.Count)
                     {
                         // 只选中对应的单元格，而不是整行
