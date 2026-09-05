@@ -16,10 +16,36 @@ namespace GameCurve.Services;
 /// </summary>
 public static class SubCurveHelper
 {
-    private static readonly Regex ArrayNum = new(@"\[(\d+)\]\s*$", RegexOptions.Compiled);
+    private static readonly Regex ArrayType = new(
+        @"^(?<type>[A-Za-z]+)\[(?<len>\d*)\]$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly HashSet<string> NumericArrayTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "float", "double", "int", "long", "short", "byte", "sbyte",
+        "uint", "ulong", "ushort", "decimal"
+    };
+
+    private static readonly HashSet<string> IntegerArrayTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "int", "long", "short", "byte", "sbyte",
+        "uint", "ulong", "ushort", "int32", "int64", "uint32", "uint64"
+    };
 
     public static bool IsArrayCol(ColumnMeta col)
-        => !string.IsNullOrEmpty(col.Type) && ArrayNum.IsMatch(col.Type);
+    {
+        if (string.IsNullOrWhiteSpace(col.Type)) return false;
+        var m = ArrayType.Match(col.Type!);
+        return m.Success && NumericArrayTypes.Contains(m.Groups["type"].Value);
+    }
+
+    /// <summary>判断数组列的元素基础类型是否为整型（int/long 等）。</summary>
+    public static bool IsIntegerArray(ColumnMeta col)
+    {
+        if (string.IsNullOrWhiteSpace(col.Type)) return false;
+        var m = ArrayType.Match(col.Type!);
+        return m.Success && IntegerArrayTypes.Contains(m.Groups["type"].Value);
+    }
 
     public static bool IsJsonCol(ColumnMeta col)
         => !string.IsNullOrWhiteSpace(col.HeaderRaw)
@@ -27,9 +53,9 @@ public static class SubCurveHelper
 
     public static int ArrayLength(ColumnMeta col)
     {
-        if (string.IsNullOrEmpty(col.Type)) return 0;
-        var m = ArrayNum.Match(col.Type);
-        return m.Success && int.TryParse(m.Groups[1].Value, out var n) ? n : 0;
+        if (!IsArrayCol(col)) return 0;
+        var m = ArrayType.Match(col.Type!);
+        return m.Success && int.TryParse(m.Groups["len"].Value, out var n) ? n : 0;
     }
 
     /// <summary>生成某表所有可显示的子曲线选项（含标量列）。</summary>
@@ -48,7 +74,8 @@ public static class SubCurveHelper
             }
             else if (IsArrayCol(col))
             {
-                int n = ArrayLength(col);
+                // 长度不固定，按整列实际数据动态扫描
+                int n = ScanArrayCount(snap, col);
                 for (int i = 0; i < n; i++)
                     list.Add(new CurveColumnOption
                     {
@@ -188,12 +215,29 @@ public static class SubCurveHelper
     private static bool TryArrayRead(string raw, int index, out double value)
     {
         value = 0;
+        var parts = SplitArray(raw);
+        if (index < 0 || index >= parts.Length) return false;
+        return CellHelper.TryParseDouble(parts[index], out value);
+    }
+
+    private static string[] SplitArray(string raw)
+    {
         var inner = raw.Trim();
         if (inner.StartsWith('[')) inner = inner[1..];
         if (inner.EndsWith(']')) inner = inner[..^1];
-        var parts = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        if (index < 0 || index >= parts.Length) return false;
-        return CellHelper.TryParseDouble(parts[index], out value);
+        return inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static int ScanArrayCount(SheetSnapshot snap, ColumnMeta col)
+    {
+        int max = 0;
+        for (int gi = 0; gi < snap.Grid.Count; gi++)
+        {
+            var raw = CellText(snap, gi, col.ColumnIndex);
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            max = Math.Max(max, SplitArray(raw).Length);
+        }
+        return max;
     }
 
     private static bool TryNumber(JsonElement el, out double value)
@@ -207,6 +251,7 @@ public static class SubCurveHelper
     /// <summary>修改子曲线后，重新生成整格文本（数组或 JSON 对象字符串）。</summary>
     public static string SetValue(string raw, CurveColumnOption opt, double y)
     {
+        if (IsIntegerArray(opt.Column)) y = Math.Round(y, MidpointRounding.AwayFromZero);
         if (opt.SubIndex >= 0)
             return SetArrayValue(raw, opt.SubIndex, y);
 
@@ -244,10 +289,7 @@ public static class SubCurveHelper
 
     private static string SetArrayValue(string raw, int index, double y)
     {
-        var inner = raw.Trim();
-        if (inner.StartsWith('[')) inner = inner[1..];
-        if (inner.EndsWith(']')) inner = inner[..^1];
-        var parts = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
+        var parts = SplitArray(raw).ToList();
         if (index < 0 || index >= parts.Count) return raw;
         parts[index] = FormatNum(y);
         return "[" + string.Join(",", parts) + "]";

@@ -170,27 +170,37 @@ public sealed class MainForm : Form
         int lw = LeftPanelWidth - 16;
         int rw = RightPanelWidth - 16;
         int ly = 30;
+        bool compactAfterSection = false;
         void L(Control c, int h = 0)
         {
+            int gap = compactAfterSection ? 2 : 6;
+            compactAfterSection = false;
             if (c.AutoSize)
             {
                 c.Location = new Point(8, ly);
                 c.Width = lw;
                 _leftPanel.Controls.Add(c);
-                ly += Math.Max(22, c.GetPreferredSize(Size.Empty).Height) + 6;
+                ly += Math.Max(22, c.GetPreferredSize(Size.Empty).Height) + gap;
             }
             else
             {
                 int hh = h == 0 ? (c.Height > 0 ? c.Height : 26) : h;
                 c.SetBounds(8, ly, lw, hh);
                 _leftPanel.Controls.Add(c);
-                ly += hh + 6;
+                ly += hh + gap;
             }
         }
         L(Section("曲线列 (Y) 多选"));
+        compactAfterSection = true;
+        L(MakeButton("清空所有选择", () =>
+        {
+            for (int i = 0; i < _colsChecked.Items.Count; i++)
+                _colsChecked.SetItemChecked(i, false);
+        }), 28);
         L(_colsChecked, 475);
         ly += 8;
         L(Section("X 轴"));
+        compactAfterSection = true;
         L(_xCombo, 26);
         L(MakeHint("行号 或 选某数值列作为 X（此时可拖动横移该列）"));
 
@@ -293,11 +303,13 @@ public sealed class MainForm : Form
         Controls.Add(_status);
 
         _grid.AllowUserToResizeRows = true;
+        _grid.AllowUserToResizeColumns = true;
         _grid.RowHeadersVisible = true;
         _grid.EditMode = DataGridViewEditMode.EditOnEnter;
-        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.DisplayedCells;
+        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
         _grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
         _grid.BackgroundColor = Color.White;
+        _grid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
 
         _menu.ShowImageMargin = false;
         _curve.ContextMenuStrip = _menu;
@@ -372,7 +384,7 @@ public sealed class MainForm : Form
         SetupWatcher(path);
         BuildSheetStrip();
         var best = FindBestDataColumn();
-        var target = best?.Sheet ?? (_wb.SheetNames.Count > 0 ? _wb.SheetNames[0] : "");
+        var target = best?.Sheet ?? _wb.SheetNames.FirstOrDefault(s => !ShouldHideSheet(s)) ?? "";
         _autoFocusSheet = best?.Sheet ?? "";
         _autoFocusCol = best?.Col.ColumnIndex ?? -1;
         ActivateSheet(target);
@@ -387,17 +399,26 @@ public sealed class MainForm : Form
         return t.Contains("序号") || t.Contains("编号");
     }
 
+    /// <summary>名含连续三个 1（111）的列不显示。</summary>
+    private static bool ShouldHideColumn(ColumnMeta c)
+        => $"{c.Name} {c.Label} {c.HeaderRaw}".Contains("111", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>名字含连续三个 1（111）的工作表不显示。</summary>
+    private static bool ShouldHideSheet(string name)
+        => name.Contains("111", StringComparison.OrdinalIgnoreCase);
+
     private (string Sheet, ColumnMeta Col)? FindBestDataColumn()
     {
         if (_wb == null) return null;
         (string Sheet, ColumnMeta Col, int Count)? best = null;
         foreach (var sheet in _wb.SheetNames)
         {
+            if (ShouldHideSheet(sheet)) continue;
             SheetSnapshot sn;
             try { sn = _wb.LoadSheet(sheet); } catch { continue; }
             foreach (var col in sn.Columns.Where(c => c.IsNumericScalar))
             {
-                if (IsOrdinalColumn(col)) continue;
+                if (IsOrdinalColumn(col) || ShouldHideColumn(col)) continue;
                 int cnt = sn.GetNumericColumn(col.ColumnIndex).Count;
                 if (best == null || cnt > best.Value.Count) best = (sheet, col, cnt);
             }
@@ -413,6 +434,7 @@ public sealed class MainForm : Form
         if (_wb == null) { _sheetStrip.ResumeLayout(); return; }
         foreach (var name in _wb.SheetNames)
         {
+            if (ShouldHideSheet(name)) continue;
             var b = new Button
             {
                 Text = name,
@@ -481,25 +503,12 @@ public sealed class MainForm : Form
         try { _snapshot = _wb.LoadSheet(_activeSheet); }
         catch (Exception ex) { _statusLabel.Text = "读取工作表失败：" + ex.Message; return; }
 
-        var nums = _snapshot.Columns.Where(c => c.IsNumericScalar).ToList();
-        var curveOptions = SubCurveHelper.BuildOptions(_snapshot);
+        var nums = _snapshot.Columns.Where(c => c.IsNumericScalar && !ShouldHideColumn(c)).ToList();
+        var curveOptions = SubCurveHelper.BuildOptions(_snapshot)
+            .Where(o => !ShouldHideColumn(o.Column))
+            .ToList();
         _colsChecked.Items.Clear();
         foreach (var o in curveOptions) _colsChecked.Items.Add(o);
-        if (curveOptions.Count > 0)
-        {
-            int focus = -1;
-            // 优先使用进入时定位的数据列；若它恰好是序号列，则在多列时跳过
-            if (_autoFocusCol >= 0)
-            {
-                int ai = curveOptions.FindIndex(o => o.Column.ColumnIndex == _autoFocusCol);
-                if (ai >= 0 && (curveOptions.Count < 2 || !IsOrdinalColumn(curveOptions[ai].Column))) focus = ai;
-            }
-            // 两列及以上时默认跳过序号/主键列，选第一个真正的数据列
-            if (focus < 0 && curveOptions.Count >= 2)
-                focus = curveOptions.FindIndex(o => !IsOrdinalColumn(o.Column));
-            if (focus < 0) focus = 0;
-            for (int i = 0; i < curveOptions.Count; i++) _colsChecked.SetItemChecked(i, i == focus);
-        }
         _autoFocusCol = -1;
 
         _xCombo.Items.Clear();
@@ -769,7 +778,8 @@ public sealed class MainForm : Form
             HeaderText = "行号",
             Name = "行号",
             ReadOnly = true,
-            Width = 60,
+            Resizable = DataGridViewTriState.True,
+            Width = 70,
             DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleCenter }
         };
         _grid.Columns.Add(header);
@@ -780,6 +790,9 @@ public sealed class MainForm : Form
                 HeaderText = col.DisplayName,
                 Name = "col" + col.ColumnIndex,
                 ReadOnly = false,
+                Resizable = DataGridViewTriState.True,
+                MinimumWidth = 60,
+                Width = 130,
                 SortMode = DataGridViewColumnSortMode.NotSortable
             };
             int ci = col.ColumnIndex;
@@ -790,6 +803,7 @@ public sealed class MainForm : Form
             if (align == HorizontalAlign.Default)
                 align = col.IsNumericScalar ? HorizontalAlign.Right : HorizontalAlign.Left;
             c.DefaultCellStyle.Alignment = MapAlign(align);
+            c.Visible = !ShouldHideColumn(col);
             if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.Column.ColumnIndex)
                 c.DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 235);
             _grid.Columns.Add(c);
@@ -1283,7 +1297,7 @@ public sealed class MainForm : Form
         Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold),
         ForeColor = Color.FromArgb(49, 110, 244),
         AutoSize = false,
-        Height = 30
+        Height = 20
     };
     private static Label MakeLabel(string t) => new() { Text = t, AutoSize = true };
     private static Label MakeHint(string t) => new()
@@ -1366,6 +1380,7 @@ public sealed class MainForm : Form
                             if (_rowToGridIndex.TryGetValue(first.RowNumber, out var firstGi) && firstGi >= 0 && firstGi < _grid.Rows.Count)
                             {
                                 _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, firstGi);
+                                _grid.FirstDisplayedScrollingColumnIndex = Math.Max(0, col - 1);
                                 _grid.CurrentCell = _grid.Rows[firstGi].Cells[col];
                             }
                         }
