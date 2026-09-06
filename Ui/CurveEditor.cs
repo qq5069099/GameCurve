@@ -40,6 +40,9 @@ public sealed class CurveEditor : Control
     private bool _additiveSelect;
     private Rectangle _marquee;
 
+    /// <summary>叠加绘制的拟合曲线（按 X 升序的折线）。</summary>
+    public List<(double X, double Y)>? OverlayPoints { get; set; }
+
     public event Action<IReadOnlyList<int>>? PointsChanged;
     public event Action? EditCommitted;
     public event Action? SelectionChanged;
@@ -212,6 +215,13 @@ public sealed class CurveEditor : Control
         _selected.Clear();
         Invalidate();
         SelectionChanged?.Invoke();
+    }
+
+    /// <summary>清除叠加的拟合曲线。</summary>
+    public void ClearOverlay()
+    {
+        OverlayPoints = null;
+        Invalidate();
     }
 
     public void SelectAll()
@@ -388,6 +398,7 @@ public sealed class CurveEditor : Control
             DrawSeries(g, plot, _series[si], si == ActiveSeriesIndex);
         if (_drag == DragMode.Marquee)
             DrawMarquee(g);
+        DrawOverlay(g);
         g.Clip = oldClip;
 
         // 悬停信息
@@ -517,6 +528,14 @@ public sealed class CurveEditor : Control
         var rect = Normalize(_marquee);
         g.FillRectangle(brush, rect);
         g.DrawRectangle(pen, rect);
+    }
+
+    private void DrawOverlay(Graphics g)
+    {
+        if (OverlayPoints == null || OverlayPoints.Count < 2) return;
+        var pts = OverlayPoints.Select(p => WorldToScreen(p.X, p.Y)).ToArray();
+        using var pen = new Pen(Color.FromArgb(120, 210, 255), 1.6f) { DashStyle = DashStyle.Dash };
+        g.DrawLines(pen, pts);
     }
 
     private void DrawHover(Graphics g, Rectangle plot, CurvePoint p)

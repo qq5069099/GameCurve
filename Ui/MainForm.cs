@@ -59,8 +59,9 @@ public sealed class MainForm : Form
     private SplitContainer _chartGridSplit = null!;
     private TableLayoutPanel _chartArea = null!;
     private readonly ContextMenuStrip _menu = new();
-    private readonly ContextMenuStrip _fitStrip = new();
-    private Button _fitButton = null!;
+    private readonly ComboBox _fitTypeCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly NumericUpDown _fitDegree = new() { DecimalPlaces = 0, Minimum = 2, Maximum = 8, Value = 2 };
+    private readonly Label _fitInfo = new() { AutoSize = false, Height = 84, Font = new Font("Microsoft YaHei UI", 7.5f), ForeColor = Color.FromArgb(70, 76, 84) };
     private Panel _gridPane = null!;
     private readonly Panel _rightPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
     private readonly Panel _leftPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
@@ -253,8 +254,21 @@ public sealed class MainForm : Form
         R(MakeLabel("随机扰动幅度:"), 20);
         R(_randUpDown, 28);
         R(MakeButton("随机扰动", () => BatchRandom((double)_randUpDown.Value)), 30);
-        _fitButton = MakeButton("拟合选中点", ShowFitMenu);
-        R(_fitButton, 30);
+        R(Section("拟合"));
+        foreach (var m in System.Enum.GetValues<FitModel>())
+            _fitTypeCombo.Items.Add(CurveFit.LabelOf(m));
+        _fitTypeCombo.SelectedIndex = 0;
+        _fitDegree.Enabled = false;
+        R(MakeLabel("类型:"), 20);
+        R(_fitTypeCombo, 28);
+        R(MakeLabel("多项式次数(仅多项式):"), 20);
+        R(_fitDegree, 28);
+        var fitButtons = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Height = 30 };
+        fitButtons.Controls.Add(MakeButton("预览", OnFitPreview));
+        fitButtons.Controls.Add(MakeButton("应用", OnFitApply));
+        fitButtons.Controls.Add(MakeButton("清除", ClearFitPreview));
+        R(fitButtons, 30);
+        R(_fitInfo, 88);
         R(MakeButton("右键更多操作", OpenContextAtChart), 30);
         ry += 10;
         R(Section("统计"));
@@ -336,6 +350,7 @@ public sealed class MainForm : Form
         };
         _xCombo.SelectedIndexChanged += (s, e) => OnSelectionChangedSafe();
         _stepUpDown.ValueChanged += (s, e) => _curve.KeyboardStep = (double)_stepUpDown.Value;
+        _fitTypeCombo.SelectedIndexChanged += (s, e) => _fitDegree.Enabled = SelectedFitModel() == FitModel.Polynomial;
 
         _curve.PointsChanged += OnPointsChanged;
         _curve.EditCommitted += OnEditCommitted;
@@ -1327,49 +1342,109 @@ public sealed class MainForm : Form
         parent.DropDownItems.Add(item);
     }
 
+    private FitModel SelectedFitModel()
+    {
+        var models = System.Enum.GetValues<FitModel>();
+        int idx = Math.Max(0, _fitTypeCombo.SelectedIndex);
+        return models[Math.Min(idx, models.Length - 1)];
+    }
+
+    private int FitDegree => decimal.ToInt32(_fitDegree.Value);
+
     private ToolStripMenuItem BuildFitMenu()
     {
         var fit = new ToolStripMenuItem("拟合选中点");
-        fit.DropDownItems.Add(AddFitItem("直线  y=ax+b", CurveFit.Kind.Linear));
-        fit.DropDownItems.Add(AddFitItem("指数  y=a*e^(bx)", CurveFit.Kind.Exponential));
-        fit.DropDownItems.Add(AddFitItem("对数  y=a+b*ln(x)", CurveFit.Kind.Logarithmic));
-        fit.DropDownItems.Add(AddFitItem("幂函数  y=a*x^b", CurveFit.Kind.Power));
-        fit.DropDownItems.Add(AddFitItem("二次多项式", CurveFit.Kind.Quadratic));
-        fit.DropDownItems.Add(AddFitItem("三次多项式", CurveFit.Kind.Cubic));
+        foreach (var m in System.Enum.GetValues<FitModel>())
+            fit.DropDownItems.Add(AddFitItem(CurveFit.LabelOf(m), m));
         return fit;
     }
 
-    private ToolStripMenuItem AddFitItem(string text, CurveFit.Kind kind)
+    private ToolStripMenuItem AddFitItem(string text, FitModel model)
     {
         var item = new ToolStripMenuItem(text);
-        item.Click += (s, e) => FitSelected(kind);
+        item.Click += (s, e) => ApplyFitModel(model);
         return item;
     }
 
-    private void ShowFitMenu()
+    private void ApplyFitModel(FitModel model)
     {
-        _fitStrip.Items.Clear();
-        foreach (ToolStripItem item in BuildFitMenu().DropDownItems)
-            _fitStrip.Items.Add(item);
-        _fitStrip.Show(_fitButton, new Point(0, _fitButton.Height));
+        var models = System.Enum.GetValues<FitModel>();
+        int idx = Array.IndexOf(models, model);
+        if (idx >= 0) _fitTypeCombo.SelectedIndex = idx;
+        OnFitApply();
     }
 
-    private void FitSelected(CurveFit.Kind kind)
+    private void OnFitPreview()
     {
         var pts = _curve.GetSelectedPoints();
         if (pts.Count < 2)
         {
-            _statusLabel.Text = "请先选择至少 2 个点，再执行拟合";
+            _statusLabel.Text = "请先选择至少 2 个点，再预览拟合";
             return;
         }
-        var f = CurveFit.Fit(pts.Select(p => (p.X, p.Y)).ToArray(), kind, out var formula, out var err);
-        if (f == null)
+        var r = CurveFit.Fit(pts.Select(p => (p.X, p.Y)).ToArray(), SelectedFitModel(), FitDegree);
+        if (r.Evaluate == null)
         {
-            MessageBox.Show(this, err, "拟合失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(this, r.Error, "拟合失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
-        _curve.ApplyToSelected(p => (p.X, f(p.X)));
-        _statusLabel.Text = $"已按{CurveFit.NameOf(kind)}拟合 {pts.Count} 个点  {formula}";
+        SetFitOverlay(r);
+        ShowFitInfo(r);
+        _statusLabel.Text = $"拟合预览：{r.Label}  R²={r.R2:0.###}  RMSE={r.RMSE:0.###}";
+    }
+
+    private void OnFitApply()
+    {
+        var pts = _curve.GetSelectedPoints();
+        if (pts.Count < 2)
+        {
+            _statusLabel.Text = "请先选择至少 2 个点，再应用拟合";
+            return;
+        }
+        var r = CurveFit.Fit(pts.Select(p => (p.X, p.Y)).ToArray(), SelectedFitModel(), FitDegree);
+        if (r.Evaluate == null)
+        {
+            MessageBox.Show(this, r.Error, "拟合失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var ev = r.Evaluate;
+        _curve.ApplyToSelected(p => (p.X, ev(p.X)));
+        SetFitOverlay(r);
+        ShowFitInfo(r);
+        _statusLabel.Text = $"已按{r.Label}应用：{r.Formula}  R²={r.R2:0.###}  RMSE={r.RMSE:0.###}";
+    }
+
+    private void ClearFitPreview()
+    {
+        _curve.ClearOverlay();
+        _fitInfo.Text = "";
+        _statusLabel.Text = "已清除拟合预览";
+    }
+
+    private void SetFitOverlay(FitResult r)
+    {
+        var pts = _curve.GetSelectedPoints();
+        if (pts.Count == 0) return;
+        double xMin = pts.Min(p => p.X), xMax = pts.Max(p => p.X);
+        if (Math.Abs(xMax - xMin) < 1e-12) xMax = xMin + 1;
+        var overlay = new List<(double X, double Y)>();
+        const int n = 200;
+        for (int i = 0; i <= n; i++)
+        {
+            double x = xMin + (xMax - xMin) * i / n;
+            double y;
+            try { y = r.Evaluate!(x); }
+            catch { y = 0; }
+            if (!double.IsFinite(y)) y = 0;
+            overlay.Add((x, y));
+        }
+        _curve.OverlayPoints = overlay;
+        _curve.Invalidate();
+    }
+
+    private void ShowFitInfo(FitResult r)
+    {
+        _fitInfo.Text = $"{r.Label}{Environment.NewLine}{r.Formula}{Environment.NewLine}R²={r.R2:0.###}  RMSE={r.RMSE:0.###}";
     }
 
     private double? PromptDouble(string title, double defaultValue)
@@ -1559,6 +1634,8 @@ public sealed class MainForm : Form
     {
         EnsureActiveSeriesSynced();
         _selInfo.Text = "选中: " + _curve.SelectedCount;
+        _curve.ClearOverlay();
+        _fitInfo.Text = "";
         if (_curve.SelectedCount > 0)
         {
             var first = _curve.Points.Where(p => _curve.SelectedRows.Contains(p.RowNumber)).FirstOrDefault();
