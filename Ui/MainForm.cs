@@ -1230,14 +1230,15 @@ public sealed class MainForm : Form
         {
             int row = snap.RowNumbers[gi];
             if (!SubCurveHelper.TryReadValue(snap, opt, gi, out var val)) continue;
-            double x = row; bool xEditable = false;
+            // 行号模式用“排除表头行的数据行序号”，与表格“行号”列保持一致（物理行号仍保留给编辑映射）
+            double x = gi + 1; bool xEditable = false;
             if (_xColumn != null)
             {
                 if (SubCurveHelper.TryReadValue(snap, _xColumn, gi, out var xv))
                 { x = xv; xEditable = true; }
                 else continue;
             }
-            points.Add(new CurvePoint(x, val, row, xEditable));
+            points.Add(new CurvePoint(x, val, row, xEditable) { DataRow = gi + 1 });
         }
         var view = new CurveSeriesView
         {
@@ -1754,7 +1755,8 @@ public sealed class MainForm : Form
         {
             var cells = new object[_snapshot.ColumnCount + 1];
             int rowNum = _snapshot.RowNumbers[gi];
-            cells[0] = rowNum;
+            // 行号列从 1 开始，即排除表头行后的数据行序号（物理行号仍通过映射保留）
+            cells[0] = gi + 1;
             _rowToGridIndex[rowNum] = gi;
             var row = _snapshot.Grid[gi];
             for (int c = 0; c < _snapshot.ColumnCount; c++)
@@ -1849,7 +1851,8 @@ public sealed class MainForm : Form
         {
             if (CellHelper.TryParseDouble(text, out var y))
             {
-                double x = _editing.TryGetValue(row, out var ce) ? ce.X : row;
+                int gi = _rowToGridIndex.TryGetValue(row, out var g) ? g : -1;
+                double x = _editing.TryGetValue(row, out var ce) ? ce.X : (gi >= 0 ? gi + 1 : row);
                 y = _activeYColumn.IsInteger ? Math.Round(y) : y;
                 _editing[row] = (x, y);
                 _committed[row] = (x, y);
@@ -1867,15 +1870,15 @@ public sealed class MainForm : Form
             return;
         if (CellHelper.TryParseDouble(text, out var y))
         {
-            double x = row; bool xEditable = false;
-            if (_xColumn != null &&
-                _rowToGridIndex.TryGetValue(row, out var xgi) &&
+            int xgi = _rowToGridIndex.TryGetValue(row, out var g) ? g : -1;
+            double x = xgi >= 0 ? xgi + 1 : row; bool xEditable = false;
+            if (_xColumn != null && xgi >= 0 &&
                 SubCurveHelper.TryReadValue(_snapshot!, _xColumn, xgi, out var xv))
             {
                 x = xv;
                 xEditable = true;
             }
-            _curve.SetSeriesPoint(si, row, x, y, xEditable);
+            _curve.SetSeriesPoint(si, row, x, y, xEditable, xgi + 1);
         }
         else
         {
@@ -2718,7 +2721,7 @@ public sealed class MainForm : Form
         for (int gi = 0; gi < snap.RowNumbers.Count; gi++)
         {
             int row = snap.RowNumbers[gi];
-            double x = row;
+            double x = gi + 1;
             if (_xColumn != null)
             {
                 if (!SubCurveHelper.TryReadValue(snap, _xColumn, gi, out var xv)) continue;
@@ -2900,7 +2903,7 @@ public sealed class MainForm : Form
 
             if (y.HasValue)
             {
-                double x = row;
+                double x = gi >= 0 ? gi + 1 : row;
                 bool xEditable = false;
                 var existing = _series[si].Points.FirstOrDefault(pp => pp.RowNumber == row);
                 if (existing != null)
@@ -2908,7 +2911,7 @@ public sealed class MainForm : Form
                     x = existing.X;
                     xEditable = existing.XEditable;
                 }
-                _curve.SetSeriesPoint(si, row, x, y.Value, xEditable);
+                _curve.SetSeriesPoint(si, row, x, y.Value, xEditable, gi + 1);
             }
             else
                 _curve.RemoveSeriesPoint(si, row);
@@ -3290,7 +3293,7 @@ public sealed class MainForm : Form
         for (int gi = 0; gi < _snapshot.RowNumbers.Count; gi++)
         {
             int row = _snapshot.RowNumbers[gi];
-            double x = row;
+            double x = gi + 1;
             if (_xColumn != null)
             {
                 if (!SubCurveHelper.TryReadValue(_snapshot, _xColumn, gi, out var xv)) continue;
@@ -3320,7 +3323,7 @@ public sealed class MainForm : Form
             // 曲线点始终按拟合值更新，且与单元格存储值保持一致（整数列取整），
             // 否则仅改写“取整后发生变化”的行会让折线新旧值混杂，看起来就不是直线。
             double chartY = !opt.IsSubCurve && opt.IsInteger ? Math.Round(y) : y;
-            _curve.SetSeriesPoint(_curve.ActiveSeriesIndex, row, x, chartY, _xColumn != null);
+            _curve.SetSeriesPoint(_curve.ActiveSeriesIndex, row, x, chartY, _xColumn != null, gi + 1);
 
             string oldText = CellText(col, row);
             string newText = opt.IsSubCurve

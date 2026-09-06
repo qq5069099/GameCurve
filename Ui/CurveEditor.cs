@@ -131,7 +131,7 @@ public sealed class CurveEditor : Control
     }
 
     /// <summary>设置某条曲线指定行的点；不存在则新增。</summary>
-    public void SetSeriesPoint(int seriesIndex, int row, double x, double y, bool xEditable)
+    public void SetSeriesPoint(int seriesIndex, int row, double x, double y, bool xEditable, int dataRow = 0)
     {
         if (seriesIndex < 0 || seriesIndex >= _series.Count) return;
         var list = _series[seriesIndex].Points;
@@ -139,11 +139,12 @@ public sealed class CurveEditor : Control
             if (list[i].RowNumber == row)
             {
                 list[i].X = x; list[i].Y = y; list[i].XEditable = xEditable;
+                if (dataRow > 0) list[i].DataRow = dataRow;
                 Invalidate();
                 return;
             }
         // 新增点按 X 升序插入，避免“接到曲线尾部”
-        var pt = new CurvePoint(x, y, row, xEditable);
+        var pt = new CurvePoint(x, y, row, xEditable) { DataRow = dataRow };
         int insertAt = list.Count;
         for (int i = 0; i < list.Count; i++)
             if (list[i].X > x) { insertAt = i; break; }
@@ -548,7 +549,7 @@ public sealed class CurveEditor : Control
     private void DrawHover(Graphics g, Rectangle plot, CurvePoint p)
     {
         var sp = WorldToScreen(p.X, p.Y);
-        string txt = $"行:{p.RowNumber}  X:{p.X:0.###}  Y:{p.Y:0.###}";
+        string txt = BuildHoverText(p);
         using var font = new Font("Microsoft YaHei UI", 8f);
         var sz = g.MeasureString(txt, font);
         int bx = (int)Math.Min(Math.Max(sp.X + 12, MarginL), ClientSize.Width - sz.Width - 8);
@@ -560,6 +561,12 @@ public sealed class CurveEditor : Control
         using var b = new SolidBrush(Color.FromArgb(40, 46, 54));
         g.DrawString(txt, font, b, bx + 5, by + 2);
     }
+
+    /// <summary>生成悬停提示文本。行号模式下 X 与“行”是同一字段，只保留“行”，不再重复显示 X。</summary>
+    private static string BuildHoverText(CurvePoint p) =>
+        p.XEditable
+            ? $"行:{p.DataRow}  X:{p.X:0.###}  Y:{p.Y:0.###}"
+            : $"行:{p.DataRow}  Y:{p.Y:0.###}";
 
     // ---------- 交互 ----------
     protected override void OnMouseDown(MouseEventArgs e)
@@ -868,7 +875,7 @@ public sealed class CurveEditor : Control
             if (hit >= 0)
             {
                 var p = ActiveSeries!.Points[hit];
-                HoverChanged?.Invoke($"行:{p.RowNumber}  X:{p.X:0.###}  Y:{p.Y:0.###}");
+                HoverChanged?.Invoke(BuildHoverText(p));
             }
             else
             {
