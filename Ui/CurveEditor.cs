@@ -96,9 +96,24 @@ public sealed class CurveEditor : Control
         ActiveSeriesIndex = activeIndex;
         _selected.Clear();
         _selectAnchor = -1;
-        _hasView = false;
-        AutoFitView();
+        // 当前视图已能显示所有可见曲线时保留视图，避免每次勾选/取消勾选都重置缩放与位置
+        if (!CurrentViewFitsVisible())
+            AutoFitView();
         Invalidate();
+    }
+
+    /// <summary>当前视图是否已包含所有可见曲线的数据点。</summary>
+    private bool CurrentViewFitsVisible()
+    {
+        if (!_hasView) return false;
+        foreach (var s in _series)
+        {
+            if (!s.Visible) continue;
+            foreach (var p in s.Points)
+                if (p.X < _xMin || p.X > _xMax || p.Y < _yMin || p.Y > _yMax)
+                    return false;
+        }
+        return true;
     }
 
     public void SetActiveSeries(int index, bool autoFit = true)

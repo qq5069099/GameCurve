@@ -1369,10 +1369,13 @@ public sealed class MainForm : Form
             }
             points.Add(new CurvePoint(x, val, row, xEditable) { DataRow = gi + 1 });
         }
+        // 颜色按列在完整列表中的固定位置取色，增删勾选变更序号时原曲线颜色保持不变
+        int colorIdx = _colsChecked.Items.IndexOf(opt);
+        if (colorIdx < 0) colorIdx = _series.Count;
         var view = new CurveSeriesView
         {
             Name = opt.DisplayName,
-            Color = CurveEditor.Palette[_series.Count % CurveEditor.Palette.Length],
+            Color = CurveEditor.Palette[colorIdx % CurveEditor.Palette.Length],
             IsEditable = editable
         };
         view.Points.AddRange(points);
