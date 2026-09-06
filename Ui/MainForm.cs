@@ -19,6 +19,11 @@ public sealed class MainForm : Form
     private string? _colCheckedTipText;
     private readonly ContextMenuStrip _gridMenu = new();
     private (int Row, int Col, GridArea Area) _gridTarget = (-1, -1, GridArea.None);
+    private int _rowHeaderAnchor = -1;   // 行头拖拽的起始行
+    private int _rowHeaderLastRow = -1;  // 行头拖拽过程中最新经过的行
+    private bool _rowHeaderDragging;     // 是否正在行头拖拽
+    private List<int> _gridTargetSel = new(); // 右键发生时捕获的已选中行
+    private bool _gridTargetRowBlock;           // 右键目标行是否属于“整行”选中块
     private readonly List<StructuralOp> _pendingStructure = new();
     private readonly List<(int Col, string Text)> _pendingHeaderRename = new();
     private readonly HashSet<int> _pendingHeaderAlign = new();
@@ -467,6 +472,9 @@ public sealed class MainForm : Form
         _grid.CellEndEdit += OnGridCellEdited;
         _grid.SelectionChanged += OnGridSelectionChanged;
         _grid.MouseDown += OnGridMouseDown;
+        _grid.MouseMove += OnGridMouseMove;
+        _grid.MouseUp += OnGridMouseUp;
+        _grid.ColumnHeaderMouseClick += OnGridColumnHeaderClick;
         _gridMenu.Opening += (s, e) => BuildGridContextMenu();
         _grid.ColumnHeaderMouseDoubleClick += OnGridColumnHeaderDoubleClick;
         _menu.Opening += (s, e) => BuildContextMenu();
@@ -2052,10 +2060,111 @@ public sealed class MainForm : Form
     }
 
     // ---------- 网格：行列结构编辑 ----------
+    /// <summary>Excel 式：单击列名（表头）选中整列。</summary>
+    private void OnGridColumnHeaderClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        int col = e.ColumnIndex;
+        BeginInvokeSafe(() => SelectGridColumn(col));
+    }
+
+    /// <summary>选中整个网格列；期间抑制选中回调，结束后手动同步一次曲线。</summary>
+    private void SelectGridColumn(int gridCol)
+    {
+        if (gridCol < 0 || gridCol >= _grid.Columns.Count) return;
+        _updatingGridSelection = true;
+        try
+        {
+            _grid.ClearSelection();
+            foreach (DataGridViewRow row in _grid.Rows)
+                row.Cells[gridCol].Selected = true;
+        }
+        finally
+        {
+            _updatingGridSelection = false;
+        }
+        OnGridSelectionChanged(_grid, EventArgs.Empty);
+    }
+
+    /// <summary>选中 [from, to] 区间内的整行；期间抑制选中回调，结束后手动同步一次曲线。</summary>
+    private void SelectGridRows(int from, int to)
+    {
+        if (_grid.Rows.Count == 0) return;
+        int lo = Math.Max(0, Math.Min(from, to));
+        int hi = Math.Min(_grid.Rows.Count - 1, Math.Max(from, to));
+        if (lo > hi) return;
+
+        _updatingGridSelection = true;
+        try
+        {
+            _grid.ClearSelection();
+            for (int gi = lo; gi <= hi; gi++)
+            {
+                var row = _grid.Rows[gi];
+                foreach (DataGridViewColumn col in _grid.Columns)
+                    if (col.Visible)
+                        row.Cells[col.Index].Selected = true;
+            }
+        }
+        finally
+        {
+            _updatingGridSelection = false;
+        }
+        OnGridSelectionChanged(_grid, EventArgs.Empty);
+    }
+
+    /// <summary>开始行头拖拽：记录锚点并选中起始行。</summary>
+    private void BeginRowHeaderDrag(int row)
+    {
+        _rowHeaderAnchor = row;
+        _rowHeaderLastRow = row;
+        _rowHeaderDragging = true;
+    }
+
+    /// <summary>行头拖拽中：鼠标悬停到其它行头时，扩展选中区间。</summary>
+    private void OnGridMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!_rowHeaderDragging) return;
+        if (_grid.Rows.Count == 0) return;
+        var hit = _grid.HitTest(e.X, e.Y);
+        if (hit.Type != DataGridViewHitTestType.RowHeader && hit.Type != DataGridViewHitTestType.Cell) return;
+        if (hit.RowIndex < 0) return;
+        int row = Math.Clamp(hit.RowIndex, 0, _grid.Rows.Count - 1);
+        if (row != _rowHeaderLastRow)
+        {
+            _rowHeaderLastRow = row;
+            SelectGridRows(_rowHeaderAnchor, row);
+        }
+    }
+
+    /// <summary>结束行头拖拽：重新确认最终选中区间并恢复光标。</summary>
+    private void OnGridMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (!_rowHeaderDragging) return;
+        _rowHeaderDragging = false;
+        int anchor = _rowHeaderAnchor;
+        int lastRow = _rowHeaderLastRow;
+        _rowHeaderAnchor = -1;
+        _rowHeaderLastRow = -1;
+        if (e.Button == MouseButtons.Left)
+            BeginInvokeSafe(() => SelectGridRows(anchor, lastRow));
+    }
+
     private void OnGridMouseDown(object? sender, MouseEventArgs e)
     {
+        if (e.Button == MouseButtons.Left)
+        {
+            var hitL = _grid.HitTest(e.X, e.Y);
+            if (hitL.Type == DataGridViewHitTestType.RowHeader && hitL.RowIndex >= 0
+                && !IsRowHeaderResizeZone(e.Y, hitL.RowIndex))
+                BeginRowHeaderDrag(hitL.RowIndex);
+            return;
+        }
         if (e.Button != MouseButtons.Right) return;
         var hit = _grid.HitTest(e.X, e.Y);
+        _gridTargetRowBlock = hit.RowIndex >= 0 && hit.Type != DataGridViewHitTestType.ColumnHeader
+            && IsRowFullySelected(hit.RowIndex);
+        _gridTargetSel = _gridTargetRowBlock ? GetSelectedGridRows() : new List<int>();
         _gridTarget = hit.Type switch
         {
             DataGridViewHitTestType.ColumnHeader => (-1, hit.ColumnIndex, GridArea.ColumnHeader),
@@ -2063,6 +2172,14 @@ public sealed class MainForm : Form
             DataGridViewHitTestType.Cell => (hit.RowIndex, hit.ColumnIndex, GridArea.Cell),
             _ => (-1, -1, GridArea.None)
         };
+    }
+
+    /// <summary>光标是否落在行头单元格底部的“行高调节”区域（此时应让行高拖拽工作，而不是选中行）。</summary>
+    private bool IsRowHeaderResizeZone(int y, int rowIndex)
+    {
+        if (rowIndex < 0 || rowIndex >= _grid.Rows.Count) return true;
+        var rect = _grid.GetRowDisplayRectangle(rowIndex, false);
+        return y >= rect.Bottom - 6;
     }
 
     private void BuildGridContextMenu()
@@ -2074,10 +2191,14 @@ public sealed class MainForm : Form
 
         if (rowTarget)
         {
+            var deleteRows = ResolveRowsToDelete(row, _gridTargetSel, _gridTargetRowBlock);
             _gridMenu.Items.Add(MakeMenu("在上方插入行", "在选中行上方插入一个空行", () => InsertGridRow(row, false), false));
             _gridMenu.Items.Add(MakeMenu("在下方插入行", "在选中行下方插入一个空行", () => InsertGridRow(row, true), false));
             _gridMenu.Items.Add(BuildCustomRowMenu(row));
-            _gridMenu.Items.Add(MakeMenu("删除当前行", "删除选中行及其数据", () => DeleteGridRow(row), false));
+            _gridMenu.Items.Add(MakeMenu(
+                deleteRows.Count > 1 ? $"删除选中的 {deleteRows.Count} 行" : "删除当前行",
+                "删除选中行及其数据",
+                () => DeleteGridRows(deleteRows), false));
         }
         if (rowTarget && colTarget)
             _gridMenu.Items.Add(new ToolStripSeparator());
@@ -2120,7 +2241,11 @@ public sealed class MainForm : Form
         _gridButton.DropDownItems.Add(RowMenu("在上方插入行", "在当前行上方插入一个空行", () => InsertGridRow(row, false)));
         _gridButton.DropDownItems.Add(RowMenu("在下方插入行", "在当前行下方插入一个空行", () => InsertGridRow(row, true)));
         _gridButton.DropDownItems.Add(BuildCustomRowMenu(row, hasRow));
-        _gridButton.DropDownItems.Add(RowMenu("删除当前行", "删除当前行及其数据", () => DeleteGridRow(row)));
+        var deleteRows = ResolveRowsToDelete(row, GetSelectedGridRows(), row >= 0 && IsRowFullySelected(row));
+        _gridButton.DropDownItems.Add(RowMenu(
+            deleteRows.Count > 1 ? $"删除选中的 {deleteRows.Count} 行" : "删除当前行",
+            "删除选中行及其数据",
+            () => DeleteGridRows(deleteRows)));
         _gridButton.DropDownItems.Add(new ToolStripSeparator());
         _gridButton.DropDownItems.Add(ColMenu("在左侧插入列", "在当前列左侧插入一个新列", () => InsertGridColumn(col, false)));
         _gridButton.DropDownItems.Add(ColMenu("在右侧插入列", "在当前列右侧插入一个新列", () => InsertGridColumn(col, true)));
@@ -2280,15 +2405,51 @@ public sealed class MainForm : Form
         return f.ShowDialog(this) == DialogResult.OK ? (int)num.Value : 0;
     }
 
-    /// <summary>删除网格行 gridRow。</summary>
-    private void DeleteGridRow(int gridRow)
+    /// <summary>当前选中的网格行索引（去重、升序、排除表头）。</summary>
+    private List<int> GetSelectedGridRows()
+        => _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0)
+            .Select(c => c.RowIndex)
+            .Distinct()
+            .OrderBy(r => r)
+            .ToList();
+
+    /// <summary>目标行是否被“整行”选中（行头拖拽得到的满行），用于区分列头/单元格选择。</summary>
+    private bool IsRowFullySelected(int gridRow)
     {
-        if (_snapshot == null || gridRow < 0 || gridRow >= _snapshot.RowNumbers.Count) return;
-        int physical = _snapshot.RowNumbers[gridRow];
-        _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.DeleteRow, physical));
-        _structureQueued = true;
-        RemapRowKeys(physical, 0, true);
-        _snapshot.DeleteRow(physical);
+        if (gridRow < 0 || gridRow >= _grid.Rows.Count) return false;
+        foreach (DataGridViewColumn c in _grid.Columns)
+            if (c.Visible && !_grid.Rows[gridRow].Cells[c.Index].Selected)
+                return false;
+        return true;
+    }
+
+    /// <summary>根据目标行与选中信息决定要删除的行：整行选中块优先，否则退化为目标单行。</summary>
+    private List<int> ResolveRowsToDelete(int targetRow, IReadOnlyList<int> selected, bool rowBlock)
+    {
+        if (targetRow >= 0 && rowBlock && selected.Count > 0) return selected.ToList();
+        if (targetRow >= 0) return new List<int> { targetRow };
+        return selected.ToList();
+    }
+    
+    /// <summary>一次性删除多个网格行（按物理行号降序，保证最低索引始终有效）。</summary>
+    private void DeleteGridRows(IReadOnlyList<int> gridRows)
+    {
+        if (_snapshot == null) return;
+        var physicals = gridRows
+            .Where(r => r >= 0 && r < _snapshot.RowNumbers.Count)
+            .Select(r => _snapshot.RowNumbers[r])
+            .Distinct()
+            .OrderByDescending(x => x)
+            .ToList();
+        if (physicals.Count == 0) return;
+        foreach (int physical in physicals)
+        {
+            _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.DeleteRow, physical));
+            _structureQueued = true;
+            RemapRowKeys(physical, 0, true);
+            _snapshot.DeleteRow(physical);
+        }
         RebuildAfterStructure();
     }
 
