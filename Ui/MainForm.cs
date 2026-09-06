@@ -1315,7 +1315,8 @@ public sealed class MainForm : Form
             _curve.SetSeries(_series, activeIndex);
             _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
             _curve.YAxisLabel = _activeYColumn.DisplayName;
-            SyncActiveColumnHighlight(activeIndex);
+            // 取消勾选时不要移动蓝色高亮：让高亮停留在用户点击的那一项，
+            // 避免“取消一个把蓝色选择跳到别的项去”的观感。
             HighlightEditableColumn();
 
             // 仅当当前编辑列发生变化时才重设提交/编辑基线；撤销历史保留。
