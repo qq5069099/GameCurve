@@ -14,6 +14,8 @@ internal static class TestHarness
         Console.OutputEncoding = System.Text.Encoding.UTF8;
         if (args.Length > 1 && args[1] == "--render")
             return Render(args);
+        if (args.Length > 1 && args[1] == "--structure")
+            return StructureTest(args);
 
         string file = args.Length > 1 && File.Exists(args[1])
             ? args[1]
@@ -78,6 +80,96 @@ internal static class TestHarness
 
         try { File.Delete(copy); } catch { }
         return ok ? 0 : 3;
+    }
+
+    private static int StructureTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm";
+        Console.WriteLine("结构测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_struct_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        var wb = new WorkbookModel();
+        wb.Open(copy);
+        string sheet = wb.SheetNames.First();
+        var snap = wb.LoadSheet(sheet);
+
+        // 1) 插入行：验证原行整体下移，新行为空（选一个在该行有值的列做探针）
+        int contentGi = Enumerable.Range(0, snap.Grid.Count).FirstOrDefault(r => snap.Grid[r].Any(x => !string.IsNullOrEmpty(x)), 0);
+        int insertRow = snap.RowNumbers[contentGi];
+        int gi = contentGi;
+        int probeCol = Enumerable.Range(0, snap.ColumnCount)
+            .FirstOrDefault(c => !string.IsNullOrEmpty(snap.Grid[gi][c]), 0);
+        string probeCell = CellHelper.ToCellReference(probeCol, insertRow);
+        string beforeVal = snap.Grid[gi][probeCol] ?? "";
+        bool ok = wb.TryApplyStructure(new[] { new StructuralOp(sheet, StructuralKind.InsertRow, insertRow) }, out var err);
+        Console.WriteLine("插入行[" + insertRow + "]: " + (ok ? "成功" : "失败 " + err));
+        wb.RefreshMeta();
+        var s2 = wb.LoadSheet(sheet);
+        int idxAfter = s2.RowNumbers.IndexOf(insertRow + 1);
+        int idxNew = s2.RowNumbers.IndexOf(insertRow);
+        bool rowShifted = s2.RowNumbers.Count == snap.RowNumbers.Count + 1
+            && s2.RowNumbers.Contains(insertRow)
+            && s2.Grid[s2.RowNumbers.IndexOf(insertRow + 1)][probeCol] == beforeVal
+            && (s2.Grid[s2.RowNumbers.IndexOf(insertRow)][probeCol] ?? "") == "";
+        Console.WriteLine("插入行后单元格从 " + probeCell + " 下移: " + (rowShifted ? "OK" : "失败"));
+
+        // 2) 删除刚插入的空行，恢复
+        bool okDel = wb.TryApplyStructure(new[] { new StructuralOp(sheet, StructuralKind.DeleteRow, insertRow) }, out var errDel);
+        wb.RefreshMeta();
+        var s3 = wb.LoadSheet(sheet);
+        bool restored = s3.RowNumbers.Count == snap.RowNumbers.Count
+            && s3.Grid[s3.RowNumbers.IndexOf(insertRow)][probeCol] == beforeVal;
+        Console.WriteLine("删除空行后恢复: " + (okDel && restored ? "OK" : "失败"));
+
+        // 3) 插入列 + 删除列：净列为 0，值右移后还原（用有值的行做探针）
+        int colIdx = Math.Min(2, snap.ColumnCount - 1);
+        int probeGi = Enumerable.Range(0, snap.Grid.Count).FirstOrDefault(r => !string.IsNullOrEmpty(snap.Grid[r][colIdx]), 0);
+        string beforeColVal = snap.Grid[probeGi][colIdx] ?? "";
+        bool okC = wb.TryApplyStructure(new[]
+        {
+            new StructuralOp(sheet, StructuralKind.InsertColumn, colIdx),
+            new StructuralOp(sheet, StructuralKind.DeleteColumn, colIdx)
+        }, out var errC);
+        wb.RefreshMeta();
+        var s4 = wb.LoadSheet(sheet);
+        bool colRestored = okC && s4.ColumnCount == snap.ColumnCount
+            && s4.Grid[probeGi][colIdx] == beforeColVal;
+        Console.WriteLine("插入列+删除列净恢复: " + (colRestored ? "OK" : "失败"));
+
+        // 4) 内存快照行列操作（不写磁盘）
+        var orig = wb.LoadSheet(sheet);
+        int rRow = orig.RowNumbers[2];
+        int origRowCount = orig.RowNumbers.Count;
+        orig.InsertRow(rRow);
+        bool memRow = orig.RowNumbers.Count == origRowCount + 1
+            && orig.RowNumbers[2] == rRow
+            && orig.RowNumbers[3] == rRow + 1;
+        orig.DeleteRow(rRow);
+        bool memRowBack = orig.RowNumbers.Count == origRowCount && orig.RowNumbers[2] == rRow;
+
+        int origCols = orig.ColumnCount;
+        orig.InsertColumn(1, "NewB");
+        bool memCol = orig.ColumnCount == origCols + 1
+            && orig.Columns[1].ColumnIndex == 1
+            && orig.Columns[2].ColumnIndex == 2
+            && orig.Grid[0].Length == origCols + 1;
+        orig.DeleteColumn(1);
+        bool memColBack = orig.ColumnCount == origCols
+            && orig.Columns[0].ColumnIndex == 0
+            && orig.Grid[0].Length == origCols;
+        orig.RenameColumn(0, "renamed:A");
+        bool memRename = orig.Columns[0].HeaderRaw == "renamed:A" && !orig.Columns[0].IsEmpty;
+        Console.WriteLine($"内存行操作: {(memRow && memRowBack ? "OK" : "失败")}; 内存列操作: {(memCol && memColBack ? "OK" : "失败")}; 重命名: {(memRename ? "OK" : "失败")}");
+
+        using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+        bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+        Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+
+        try { File.Delete(copy); } catch { }
+        return rowShifted && restored && colRestored && memRow && memRowBack && memCol && memColBack && memRename ? 0 : 3;
     }
 
     private static int Render(string[] args)

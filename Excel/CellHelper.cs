@@ -95,6 +95,37 @@ public static class CellHelper
         return LetterToColumnIndex(new string(refText.TakeWhile(char.IsLetter).ToArray()));
     }
 
+    /// <summary>按引用查找单元格；不存在时返回 null（不创建）。</summary>
+    public static Cell? FindCell(WorksheetPart wsPart, string cellRef)
+    {
+        var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
+        if (sheetData == null) return null;
+        return sheetData.Descendants<Cell>().FirstOrDefault(c =>
+            string.Equals(c.CellReference?.Value, cellRef, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// 一次性扫描工作表，把指定行号区间内（通常是表头行以下的数据区）存在的单元格
+    /// 按列索引分组返回。用于批量设置整列对齐，避免针对每个单元格重复扫描整个表格。
+    /// </summary>
+    public static Dictionary<int, List<Cell>> GetCellsByColumn(WorksheetPart wsPart, int startRow, int endRow)
+    {
+        var result = new Dictionary<int, List<Cell>>();
+        var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
+        if (sheetData == null) return result;
+        foreach (var cell in sheetData.Descendants<Cell>())
+        {
+            var refText = cell.CellReference?.Value ?? "";
+            if (string.IsNullOrEmpty(refText)) continue;
+            int col = LetterToColumnIndex(new string(refText.TakeWhile(char.IsLetter).ToArray()));
+            int row = RowNumberFromRef(refText);
+            if (row < startRow || row > endRow) continue;
+            if (!result.TryGetValue(col, out var list)) { list = new(); result[col] = list; }
+            list.Add(cell);
+        }
+        return result;
+    }
+
     /// <summary>按引用获取单元格；不存在则创建并插入到正确排序位置。</summary>
     public static Cell GetOrCreateCell(WorksheetPart wsPart, string cellRef)
     {

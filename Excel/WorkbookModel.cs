@@ -90,13 +90,18 @@ public sealed class WorkbookModel : IDisposable
 
         int headerRow = DetectHeaderRow(rows);
         string?[] headerRaw = new string?[maxCol];
+        var headerAligns = new HorizontalAlign[maxCol];
+        Array.Fill(headerAligns, HorizontalAlign.Default);
         if (rows.TryGetValue(headerRow, out var hc))
         {
             foreach (var cell in hc)
             {
                 int colIdx = CellHelper.GetColumnIndex(cell);
                 if (colIdx >= 0 && colIdx < maxCol)
+                {
                     headerRaw[colIdx] = CellHelper.GetCellValue(cell);
+                    headerAligns[colIdx] = AlignOf(cell, cellFormats) ?? HorizontalAlign.Default;
+                }
             }
         }
 
@@ -171,6 +176,7 @@ public sealed class WorkbookModel : IDisposable
             if (alignVotes.TryGetValue(c, out var votes) && votes.Count > 0)
                 align = votes.OrderByDescending(kv => kv.Value).First().Key;
             snap.ColumnAlignments.Add(align);
+            snap.HeaderAlignments.Add(headerAligns[c]);
         }
 
         _cache[sheetName] = snap;
@@ -268,6 +274,172 @@ public sealed class WorkbookModel : IDisposable
         }
     }
 
+    /// <summary>
+    /// 批量写回表头单元格的水平对齐样式。只为已存在的表头单元格新建/复用样式，
+    /// 不会修改其它单元格或共享样式，因此不会影响数据列的外观与格式。
+    /// </summary>
+    public bool TryWriteHeaderAlignments(IReadOnlyList<(string Sheet, int Col, int HeaderRow, HorizontalAlign Align)> writes, out string? error)
+    {
+        error = null;
+        if (writes.Count == 0) return true;
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            var stylesPart = wbPart.WorkbookStylesPart;
+            if (stylesPart?.Stylesheet == null)
+                throw new InvalidOperationException("工作簿缺少样式表，无法写入表头对齐。");
+            var stylesheet = stylesPart.Stylesheet;
+            var cellFormats = stylesheet.GetFirstChild<CellFormats>();
+            if (cellFormats == null)
+                cellFormats = stylesheet.AppendChild(new CellFormats());
+
+            var groups = writes.GroupBy(w => w.Sheet);
+            foreach (var group in groups)
+            {
+                var wsPart = GetWorksheetPart(wbPart, group.Key);
+                foreach (var w in group)
+                {
+                    string cellRef = CellHelper.ToCellReference(w.Col, w.HeaderRow);
+                    var cell = CellHelper.FindCell(wsPart, cellRef);
+                    if (cell == null) continue; // 表头单元格不存在时不强行新建，避免写入多余单元格
+
+                    uint idx = EnsureAlignmentCellFormat(cellFormats, cell, w.Align);
+                    cell.StyleIndex = idx;
+                }
+            }
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 批量写回某列数据单元格的水平对齐样式。只处理已存在的数据单元格（表头行以下），
+    /// 不会新建空单元格，也不会修改其它列或共享样式。
+    /// </summary>
+    public bool TryWriteColumnAlignments(IReadOnlyList<(string Sheet, int Col, int HeaderRow, int MaxRow, HorizontalAlign Align)> writes, out string? error)
+    {
+        error = null;
+        if (writes.Count == 0) return true;
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            var stylesPart = wbPart.WorkbookStylesPart;
+            if (stylesPart?.Stylesheet == null)
+                throw new InvalidOperationException("工作簿缺少样式表，无法写入列内容对齐。");
+            var stylesheet = stylesPart.Stylesheet;
+            var cellFormats = stylesheet.GetFirstChild<CellFormats>();
+            if (cellFormats == null)
+                cellFormats = stylesheet.AppendChild(new CellFormats());
+
+            var groups = writes.GroupBy(w => w.Sheet);
+            foreach (var group in groups)
+            {
+                var wsPart = GetWorksheetPart(wbPart, group.Key);
+                int rangeStart = group.Min(w => w.HeaderRow) + 1;
+                int rangeEnd = group.Max(w => w.MaxRow);
+                var byCol = CellHelper.GetCellsByColumn(wsPart, rangeStart, rangeEnd);
+                foreach (var w in group)
+                {
+                    if (!byCol.TryGetValue(w.Col, out var cells)) continue;
+                    foreach (var cell in cells)
+                    {
+                        uint idx = EnsureAlignmentCellFormat(cellFormats, cell, w.Align);
+                        cell.StyleIndex = idx;
+                    }
+                }
+            }
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 在样式表里找到与“当前单元格样式 + 目标水平对齐”一致的 CellFormat；没有则新建一个克隆，
+    /// 只改水平对齐，保留字体/填充/边框/数字格式。返回该样式的索引。
+    /// </summary>
+    private static uint EnsureAlignmentCellFormat(CellFormats cellFormats, Cell cell, HorizontalAlign align)
+    {
+        var existing = cellFormats.Elements<CellFormat>().ToList();
+        var targetHv = align switch
+        {
+            HorizontalAlign.Left => HorizontalAlignmentValues.Left,
+            HorizontalAlign.Right => HorizontalAlignmentValues.Right,
+            _ => HorizontalAlignmentValues.Center
+        };
+
+        uint baseIndex = cell.StyleIndex?.Value ?? 0;
+        CellFormat? baseFmt = baseIndex < existing.Count ? existing[(int)baseIndex] : null;
+        var desiredAlign = BuildAlignment(baseFmt, targetHv);
+
+        // 优先复用完全一致的样式
+        for (int i = 0; i < existing.Count; i++)
+            if (AlignmentFormatMatches(existing[i], baseFmt, desiredAlign))
+                return (uint)i;
+
+        // 否则克隆基准样式，仅替换水平对齐
+        var clone = baseFmt == null ? new CellFormat() : (CellFormat)baseFmt.CloneNode(true);
+        clone.Alignment?.Remove();
+        clone.Alignment = desiredAlign;
+        cellFormats.AppendChild(clone);
+        return (uint)(cellFormats.Count() - 1);
+    }
+
+    private static bool AlignmentFormatMatches(CellFormat fmt, CellFormat? baseFmt, Alignment desiredAlign)
+    {
+        if (baseFmt != null)
+        {
+            if (fmt.NumberFormatId?.Value != baseFmt.NumberFormatId?.Value) return false;
+            if (fmt.FontId?.Value != baseFmt.FontId?.Value) return false;
+            if (fmt.FillId?.Value != baseFmt.FillId?.Value) return false;
+            if (fmt.BorderId?.Value != baseFmt.BorderId?.Value) return false;
+            if (fmt.ApplyNumberFormat?.Value != baseFmt.ApplyNumberFormat?.Value) return false;
+            if (fmt.ApplyFont?.Value != baseFmt.ApplyFont?.Value) return false;
+            if (fmt.ApplyFill?.Value != baseFmt.ApplyFill?.Value) return false;
+            if (fmt.ApplyBorder?.Value != baseFmt.ApplyBorder?.Value) return false;
+        }
+        return fmt.Alignment?.Horizontal == desiredAlign.Horizontal
+            && fmt.Alignment?.Vertical == desiredAlign.Vertical;
+    }
+
+    private static Alignment BuildAlignment(CellFormat? baseFmt, HorizontalAlignmentValues hv)
+    {
+        var old = baseFmt?.Alignment;
+        return new Alignment
+        {
+            Horizontal = hv,
+            Vertical = old?.Vertical,
+            WrapText = old?.WrapText,
+            TextRotation = old?.TextRotation,
+            Indent = old?.Indent,
+            ReadingOrder = old?.ReadingOrder,
+            ShrinkToFit = old?.ShrinkToFit
+        };
+    }
+
     /// <summary>保存到新路径（另存为）。</summary>
     public bool TrySaveAs(string destination, out string? error)
     {
@@ -280,6 +452,53 @@ public sealed class WorkbookModel : IDisposable
         catch (Exception ex)
         {
             error = "另存为失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 按顺序批量应用结构改动（插入/删除行列），一次打开并保存，失败返回原因。
+    /// 改动只平移现有单元格，不动样式与公式，宏文件（vbaProject.bin）原样保留。
+    /// </summary>
+    public bool TryApplyStructure(IReadOnlyList<StructuralOp> ops, out string? error)
+    {
+        error = null;
+        if (ops.Count == 0) return true;
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            foreach (var op in ops)
+            {
+                var wsPart = GetWorksheetPart(wbPart, op.Sheet);
+                switch (op.Kind)
+                {
+                    case StructuralKind.InsertRow:
+                        SheetStructure.InsertRow(wsPart, op.Index);
+                        break;
+                    case StructuralKind.DeleteRow:
+                        SheetStructure.DeleteRow(wsPart, op.Index);
+                        break;
+                    case StructuralKind.InsertColumn:
+                        SheetStructure.InsertColumn(wsPart, op.Index);
+                        break;
+                    case StructuralKind.DeleteColumn:
+                        SheetStructure.DeleteColumn(wsPart, op.Index);
+                        break;
+                }
+            }
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存失败：" + ex.Message;
             return false;
         }
     }

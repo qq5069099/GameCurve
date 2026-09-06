@@ -112,6 +112,51 @@ public static class CurveFit
     public static FitResult Fit(IReadOnlyList<(double X, double Y)> pts, FitModel model, int degree = 2)
         => Fit(pts, new FitOptions { Model = model, PolynomialDegree = degree });
 
+    /// <summary>
+    /// 返回一条“过首尾两点”的拟合曲线：在原拟合基础上施加一次线性纠偏，
+    /// 使曲线恰好经过数据的第一个与最后一个点（按 X 升序）。直线时即为精确的过两点直线；
+    /// 其它线型保持原模型形态，仅倾斜/平移使其过两端。同时按修正后曲线重算 R² / RMSE。
+    /// </summary>
+    public static FitResult PassThroughEndpoints(FitResult r, IReadOnlyList<(double X, double Y)> pts)
+    {
+        if (r.Evaluate == null) return r;
+        var d = pts.Where(p => double.IsFinite(p.X) && double.IsFinite(p.Y)).OrderBy(p => p.X).ToList();
+        if (d.Count < 2) return r;
+        var (x1, y1) = d[0];
+        var (x2, y2) = d[^1];
+        if (Math.Abs(x2 - x1) < 1e-12) return r;
+
+        var f = r.Evaluate;
+        double d1 = y1 - f(x1), d2 = y2 - f(x2);
+        double slope = (d2 - d1) / (x2 - x1);
+        double inter = d1 - slope * x1;
+        var eval = new Func<double, double>(x => f(x) + slope * x + inter);
+
+        var result = new FitResult
+        {
+            Model = r.Model,
+            Label = r.Label + "（过首尾两点）",
+            Formula = r.Formula,
+            Parameters = r.Parameters,
+            Converged = r.Converged,
+            Error = r.Error,
+            Evaluate = eval,
+        };
+        var (r2, rmse) = Goodness(d, eval);
+        result.R2 = r2;
+        result.RMSE = rmse;
+
+        // 直线：直接改写为过两点的直线参数与公式
+        if (r.Model == FitModel.Linear && r.Parameters.Count >= 2)
+        {
+            double b = r.Parameters[1].Value + slope;
+            double a = r.Parameters[0].Value + inter;
+            result.Formula = $"y = {F(a)} {(b >= 0 ? "+" : "-")} {F(Math.Abs(b))}x";
+            result.Parameters = new[] { new FitParameter("a", a), new FitParameter("b", b) };
+        }
+        return result;
+    }
+
     /// <summary>高级拟合：支持固定/覆盖参数与多项式正则化。</summary>
     public static FitResult Fit(IReadOnlyList<(double X, double Y)> pts, FitOptions opt)
     {

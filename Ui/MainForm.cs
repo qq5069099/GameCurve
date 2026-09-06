@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using GameCurve.Excel;
 using GameCurve.Models;
 using GameCurve.Services;
@@ -13,11 +14,24 @@ public sealed class MainForm : Form
     private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
     private readonly DataGridView _grid = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false };
     private readonly ToolTip _tip = new() { AutoPopDelay = 12000, InitialDelay = 500, ReshowDelay = 120 };
+    private readonly ContextMenuStrip _gridMenu = new();
+    private (int Row, int Col, GridArea Area) _gridTarget = (-1, -1, GridArea.None);
+    private readonly List<StructuralOp> _pendingStructure = new();
+    private readonly List<(int Col, string Text)> _pendingHeaderRename = new();
+    private readonly HashSet<int> _pendingHeaderAlign = new();
+    private readonly HashSet<int> _pendingColumnAlign = new();
+    private bool _structureQueued;
+    private TextBox? _headerEdit;
+    private int _headerEditPhysicalCol = -1;   // -1 表示没有在编辑列名
 
     private readonly ToolStrip _tool = new();
     private readonly ToolStripButton _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
     private readonly ToolStripDropDownButton _openMenu = new("打开");
+    private readonly ToolStripDropDownButton _gridButton = new("表格");
     private readonly ToolStripDropDownButton _layoutButton = new("布局");
+    private ToolStripMenuItem _gridMaxItem = null!;
+    private ToolStripMenuItem _gridBottomItem = null!;
+    private ToolStripMenuItem _gridRightItem = null!;
     private readonly StatusStrip _status = new();
     private readonly ToolStripStatusLabel _statusLabel = new() { Text = "就绪" };
     private readonly ToolStripStatusLabel _hoverLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -84,6 +98,7 @@ public sealed class MainForm : Form
     private readonly Dictionary<(int Col, int Row), string> _subEditOldText = new();
 
     private bool _gridAtRight;
+    private bool _gridMaximized;
     private bool _suppressRebuild;
     private bool _syncFromGrid;
     private bool _updatingGridSelection;
@@ -92,6 +107,15 @@ public sealed class MainForm : Form
     private string _activeSheet = "";
     private string _autoFocusSheet = "";
     private int _autoFocusCol = -1;
+
+    private enum GridArea
+    {
+        None = 0,
+        Cell = 1,
+        ColumnHeader = 2,
+        RowHeader = 3
+    }
+
     private sealed class SheetLoadData
     {
         public SheetSnapshot? Snapshot;
@@ -185,9 +209,18 @@ public sealed class MainForm : Form
         _tool.Items.Add(new ToolStripSeparator());
         AddButton("导出PNG", "把当前曲线图导出为 PNG 图片", OnExport);
         _tool.Items.Add(_autoSaveCheck);
-        _layoutButton.DropDownItems.Add(MakeMenu("表格置底", "表格放在曲线区下方", () => SetGridSide(false), true));
-        _layoutButton.DropDownItems.Add(MakeMenu("表格靠右", "表格与曲线区左右并列", () => SetGridSide(true), false));
+        _gridButton.DropDownOpening += (s, e) => BuildGridToolbarMenu();
+        _tool.Items.Add(_gridButton);
+        // “布局”菜单统一放置表格的布局切换：最大化/还原、置底/靠右
+        _gridMaxItem = MakeMenu("表格最大化", "把表格铺满主窗口，便于编辑数据（F11）", ToggleGridMaximize, false);
+        _gridBottomItem = MakeMenu("表格置底", "表格放在曲线区下方", () => SetGridSide(false), true);
+        _gridRightItem = MakeMenu("表格靠右", "表格与曲线区左右并列", () => SetGridSide(true), false);
+        _layoutButton.DropDownItems.Add(_gridMaxItem);
+        _layoutButton.DropDownItems.Add(new ToolStripSeparator());
+        _layoutButton.DropDownItems.Add(_gridBottomItem);
+        _layoutButton.DropDownItems.Add(_gridRightItem);
         _tool.Items.Add(_layoutButton);
+        UpdateLayoutMenu();
         _tool.Dock = DockStyle.Top;
         Controls.Add(_tool);
 
@@ -217,11 +250,32 @@ public sealed class MainForm : Form
         }
         L(Section("曲线列 (Y) 多选"));
         compactAfterSection = true;
-        L(MakeButton("清空所有选择", () =>
+        var refreshBtn = MakeButton("刷新列名", RefreshColumnNames);
+        var clearBtn = MakeButton("清空选择", () =>
         {
             for (int i = 0; i < _colsChecked.Items.Count; i++)
                 _colsChecked.SetItemChecked(i, false);
-        }), 28);
+        });
+        int btnGap = 4;
+        int halfW = (lw - btnGap) / 2;
+        refreshBtn.Size = new Size(halfW, 26);
+        refreshBtn.Margin = new Padding(0);
+        clearBtn.Size = new Size(lw - btnGap - halfW, 26);
+        clearBtn.Margin = new Padding(btnGap, 0, 0, 0);
+        var colBtnPanel = new FlowLayoutPanel
+        {
+            AutoSize = false,
+            Width = lw,
+            Height = 26,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0),
+            Margin = new Padding(0),
+            BackColor = Color.Transparent
+        };
+        colBtnPanel.Controls.Add(refreshBtn);
+        colBtnPanel.Controls.Add(clearBtn);
+        L(colBtnPanel, 26);
         L(_colsChecked, 475);
         ly += 8;
         L(Section("X 轴"));
@@ -249,6 +303,11 @@ public sealed class MainForm : Form
             }
         }
         R(_selInfo, 24);
+        R(MakeButton("填充空白", FillBlanks), 30);
+		R(MakeLabel("随机扰动幅度:"), 20);
+        R(_randUpDown, 28);
+        R(MakeButton("随机扰动(选中点)", () => BatchRandom((double)_randUpDown.Value)), 30);
+        R(MakeButton("曲线平滑(选中点)", BatchSmoothSelected), 30);
         R(MakeLabel("选中点数值:"), 20);
         R(_valUpDown, 28);
         R(MakeButton("应用值", OnApplyValue), 30);
@@ -268,9 +327,6 @@ public sealed class MainForm : Form
         R(MakeButton("钳制", () => BatchClamp((double)_clampMin.Value, (double)_clampMax.Value)), 30);
         R(MakeButton("整列平滑", BatchSmooth), 30);
         R(MakeButton("整列归一化", BatchNormalize), 30);
-        R(MakeLabel("随机扰动幅度:"), 20);
-        R(_randUpDown, 28);
-        R(MakeButton("随机扰动", () => BatchRandom((double)_randUpDown.Value)), 30);
         R(Section("拟合"));
         foreach (var m in System.Enum.GetValues<FitModel>())
             _fitTypeCombo.Items.Add(CurveFit.LabelOf(m));
@@ -345,12 +401,16 @@ public sealed class MainForm : Form
 
         _grid.AllowUserToResizeRows = true;
         _grid.AllowUserToResizeColumns = true;
+        _grid.AllowUserToOrderColumns = true;           // 列名按住拖拽移动顺序
         _grid.RowHeadersVisible = true;
-        _grid.EditMode = DataGridViewEditMode.EditOnEnter;
+        _grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;  // 点击只选中，键入/F2/双击进入编辑（Excel 式）
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
         _grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
+        _grid.MultiSelect = true;                        // 支持框选多个单元格
         _grid.BackgroundColor = Color.White;
         _grid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+        _grid.ContextMenuStrip = _gridMenu;
+        _gridMenu.ShowImageMargin = false;
 
         _menu.ShowImageMargin = false;
         _curve.ContextMenuStrip = _menu;
@@ -362,6 +422,7 @@ public sealed class MainForm : Form
     {
         _colsChecked.ItemCheck += (s, e) =>
         {
+            if (_suppressRebuild) return;
             _preferredListIndex = e.Index;
             _preferredListChecked = e.NewValue == CheckState.Checked;
             BeginInvoke((Action)OnSelectionChanged);
@@ -376,6 +437,9 @@ public sealed class MainForm : Form
         _curve.HoverChanged += s => _hoverLabel.Text = s;
         _grid.CellEndEdit += OnGridCellEdited;
         _grid.SelectionChanged += OnGridSelectionChanged;
+        _grid.MouseDown += OnGridMouseDown;
+        _gridMenu.Opening += (s, e) => BuildGridContextMenu();
+        _grid.ColumnHeaderMouseDoubleClick += OnGridColumnHeaderDoubleClick;
         _menu.Opening += (s, e) => BuildContextMenu();
 
         _autoSaveTimer.Tick += (s, e) => { _autoSaveTimer.Stop(); CommitPending(); };
@@ -384,9 +448,21 @@ public sealed class MainForm : Form
         KeyPreview = true;
         KeyDown += (s, e) =>
         {
-            if (e.Control && e.KeyCode == Keys.S) { OnSave(); e.Handled = true; }
+            if (e.KeyCode == Keys.F11) { ToggleGridMaximize(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.S) { OnSave(); e.Handled = true; }
             else if (e.Control && e.KeyCode == Keys.Z) { Undo(); e.Handled = true; }
             else if (e.Control && e.KeyCode == Keys.Y) { Redo(); e.Handled = true; }
+            else if (_grid.IsCurrentCellInEditMode)
+            {
+                // 单元格正在编辑：C/X/V/Delete 交给编辑框自己处理
+                if (e.KeyCode == Keys.Delete || (e.Control && (e.KeyCode == Keys.C || e.KeyCode == Keys.X || e.KeyCode == Keys.V)))
+                    return;
+            }
+            else if (e.Control && e.KeyCode == Keys.C) { CopySelection(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.X) { CutSelection(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.V) { PasteFromClipboard(); e.Handled = true; }
+            // Delete 只清除“表格(excel)”拥有焦点时的单元格值；曲线选中点、曲线获得焦点时不触发删除
+            else if (e.KeyCode == Keys.Delete && !e.Control && _grid.ContainsFocus) { ClearSelection(); e.Handled = true; }
         };
     }
 
@@ -637,17 +713,24 @@ public sealed class MainForm : Form
         StartSheetLoad(name);
     }
 
-    private bool HasUnsavedChanges() => _dirtyCells.Count > 0;
+    private bool HasUnsavedChanges() => _dirtyCells.Count > 0 || _structureQueued || _pendingHeaderRename.Count > 0 || _pendingHeaderAlign.Count > 0 || _pendingColumnAlign.Count > 0;
 
     private void DiscardUnsaved()
     {
+        bool hadStructure = _structureQueued;
         _dirtyCells.Clear();
+        _pendingStructure.Clear();
+        _pendingHeaderRename.Clear();
+        _pendingHeaderAlign.Clear();
+        _pendingColumnAlign.Clear();
+        _structureQueued = false;
         _pendingUndoRows.Clear();
         _subEditOldText.Clear();
         _editing.Clear();
         _committed.Clear();
         _undo.Clear();
         _redo.Clear();
+        if (hadStructure && _wb != null) _wb.RefreshMeta();
         UpdateTitle();
     }
 
@@ -892,30 +975,94 @@ public sealed class MainForm : Form
 
     private void CommitPending()
     {
-        if (_wb == null || _dirtyCells.Count == 0) return;
+        if (_wb == null) return;
+        bool hasStructure = _pendingStructure.Count > 0;
+        if (_dirtyCells.Count == 0 && !hasStructure && _pendingHeaderRename.Count == 0 && _pendingHeaderAlign.Count == 0 && _pendingColumnAlign.Count == 0) return;
         _autoSaveTimer.Stop();
+        var sheet = _snapshot?.SheetName ?? _activeSheet;
+
+        // 1) 先应用结构改动（行/列增删），使现有单元格平移到位
+        if (hasStructure)
+        {
+            _selfWrite = true;
+            bool okStructure = _wb.TryApplyStructure(_pendingStructure, out var errStructure);
+            _selfWrite = false;
+            if (!okStructure)
+            {
+                _statusLabel.Text = "⚠ " + errStructure;
+                UpdateTitle();
+                return;
+            }
+            _pendingStructure.Clear();
+            _structureQueued = false;
+        }
+
         var nums = new List<CellWrite>();
         var strs = new List<CellWriteString>();
+
+        // 2) 表头重命名写回
+        foreach (var (col, text) in _pendingHeaderRename)
+            strs.Add(new CellWriteString(sheet, CellHelper.ToCellReference(col, _snapshot?.HeaderRow ?? 1), text));
+
+        // 3) 常规单元格写回
         foreach (var (col, row) in _dirtyCells)
         {
             if (col < 0 || col >= _snapshot!.Columns.Count) continue;
+            if (row == _snapshot.HeaderRow) continue; // 表头行不存放在数据网格中
             var meta = _snapshot.Columns[col];
             string text = CellText(col, row);
-            string cellRef = CellHelper.ToCellReference(col, row);
             if (meta.IsNumericScalar && CellHelper.TryParseDouble(text, out var v))
-                nums.Add(new CellWrite(_snapshot.SheetName, cellRef, v, meta.IsInteger, 6));
+                nums.Add(new CellWrite(sheet, CellHelper.ToCellReference(col, row), v, meta.IsInteger, 6));
             else
-                strs.Add(new CellWriteString(_snapshot.SheetName, cellRef, text));
+                strs.Add(new CellWriteString(sheet, CellHelper.ToCellReference(col, row), text));
         }
         _selfWrite = true;
         bool ok = _wb.TryWriteCells(nums, out var errNum);
         bool okStr = _wb.TryWriteCellsString(strs, out var errStr);
         _selfWrite = false;
+
+        // 4) 表头对齐写回（在字符串写回之后，保证重命名新建的表头单元格已存在）
+        bool okHeader = true;
+        string? errHeader = null;
+        if (_pendingHeaderAlign.Count > 0)
+        {
+            int headerRow = _snapshot?.HeaderRow ?? 1;
+            var headerAligns = new List<(string, int, int, HorizontalAlign)>();
+            foreach (var col in _pendingHeaderAlign)
+                if (col >= 0 && col < _snapshot!.Columns.Count)
+                    headerAligns.Add((sheet, col, headerRow, _snapshot.HeaderAlignments[col]));
+            _selfWrite = true;
+            okHeader = _wb.TryWriteHeaderAlignments(headerAligns, out errHeader);
+            _selfWrite = false;
+            if (okHeader) _pendingHeaderAlign.Clear();
+        }
+
+        // 5) 列内容对齐写回（只处理已存在的数据单元格，覆盖整列）
+        bool okColAlign = true;
+        string? errColAlign = null;
+        if (_pendingColumnAlign.Count > 0)
+        {
+            int headerRow = _snapshot?.HeaderRow ?? 1;
+            int maxRow = _snapshot?.MaxRow ?? headerRow;
+            var colAligns = new List<(string, int, int, int, HorizontalAlign)>();
+            foreach (var col in _pendingColumnAlign)
+                if (col >= 0 && col < _snapshot!.Columns.Count)
+                    colAligns.Add((sheet, col, headerRow, maxRow, _snapshot.ColumnAlignments[col]));
+            _selfWrite = true;
+            okColAlign = _wb.TryWriteColumnAlignments(colAligns, out errColAlign);
+            _selfWrite = false;
+            if (okColAlign) _pendingColumnAlign.Clear();
+        }
+
         if (!ok) _statusLabel.Text = "⚠ " + errNum;
         else if (!okStr) _statusLabel.Text = "⚠ " + errStr;
+        else if (!okHeader) _statusLabel.Text = "⚠ " + errHeader;
+        else if (!okColAlign) _statusLabel.Text = "⚠ " + errColAlign;
         else
         {
             _statusLabel.Text = $"已保存 {nums.Count + strs.Count} 个单元格";
+            _structureQueued = false;
+            _pendingHeaderRename.Clear();
             _dirtyCells.Clear();
         }
         UpdateTitle();
@@ -954,6 +1101,7 @@ public sealed class MainForm : Form
     // ---------- 网格 ----------
     private void BuildGrid()
     {
+        CancelHeaderEdit();
         _grid.Columns.Clear();
         if (_snapshot == null) { _grid.Rows.Clear(); return; }
         var header = new DataGridViewTextBoxColumn
@@ -961,6 +1109,7 @@ public sealed class MainForm : Form
             HeaderText = "行号",
             Name = "行号",
             ReadOnly = true,
+            Frozen = true,
             Resizable = DataGridViewTriState.True,
             Width = 70,
             DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleCenter }
@@ -986,6 +1135,10 @@ public sealed class MainForm : Form
             if (align == HorizontalAlign.Default)
                 align = col.IsNumericScalar ? HorizontalAlign.Right : HorizontalAlign.Left;
             c.DefaultCellStyle.Alignment = MapAlign(align);
+            var headerAlign = ci >= 0 && ci < _snapshot.HeaderAlignments.Count
+                ? _snapshot.HeaderAlignments[ci]
+                : HorizontalAlign.Default;
+            c.HeaderCell.Style.Alignment = MapHeaderAlign(headerAlign);
             c.Visible = !ShouldHideColumn(col);
             if (_activeYColumn != null && col.ColumnIndex == _activeYColumn.Column.ColumnIndex)
                 c.DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 235);
@@ -1041,13 +1194,51 @@ public sealed class MainForm : Form
         int row = _snapshot.RowNumbers[e.RowIndex];
         var cell = _grid.Rows[e.RowIndex].Cells[e.ColumnIndex];
         string text = cell.Value?.ToString() ?? "";
-        string oldText = CellText(col, row);
-        if (text == oldText) return;
+        ApplyGridCellEdit(col, row, text);
+        if (_autoSaveCheck.Checked) CommitPending();
+    }
 
-        // 更新曲线（若该列被绘制）
-        ApplyPlottedCellChange(col, row, text);
+    /// <summary>
+    /// 把一个单元格的新值提交到快照/曲线/撤销栈。供网格编辑结束、剪切、粘贴、删除键共用。
+    /// </summary>
+    private void ApplyGridCellEdit(int col, int row, string text)
+        => ApplyCellEdits(new[] { (col, row, text) });
 
-        // 当前编辑列（可拖动那条）的编辑基线同步
+    /// <summary>
+    /// 批量应用单元格新值（剪切/粘贴/清除共用）：一次性提交一条撤销记录，并同步曲线与脏点。
+    /// 返回实际被改动的单元格（物理列、物理行），供调用方刷新网格显示。
+    /// </summary>
+    private List<(int Col, int Row)> ApplyCellEdits(IEnumerable<(int Col, int Row, string Text)> edits)
+    {
+        var changed = new List<(int, int, string, string)>();
+        var touched = new List<(int Col, int Row)>();
+        if (_snapshot == null) return touched;
+        foreach (var (col, row, text) in edits)
+        {
+            if (col < 0 || col >= _snapshot.ColumnCount) continue;
+            if (!_rowToGridIndex.TryGetValue(row, out var gi) || gi < 0 || gi >= _snapshot.Grid.Count) continue;
+            string oldText = CellText(col, row);
+            if (text == oldText) continue;
+
+            ApplyPlottedCellChange(col, row, text);
+            SyncActiveBaseline(col, row, text);
+            UpdateSnapshotCell(row, col, text);
+            _dirtyCells.Add((col, row));
+            changed.Add((col, row, oldText, text));
+            touched.Add((col, row));
+        }
+        if (changed.Count > 0)
+        {
+            _undo.Add(new EditCmd(changed));
+            _redo.Clear();
+            UpdateStats();
+            UpdateTitle();
+        }
+        return touched;
+    }
+
+    private void SyncActiveBaseline(int col, int row, string text)
+    {
         if (_activeYColumn != null && col == _activeYColumn.Column.ColumnIndex && !_activeYColumn.IsSubCurve)
         {
             if (CellHelper.TryParseDouble(text, out var y))
@@ -1059,14 +1250,6 @@ public sealed class MainForm : Form
             }
             else { _editing.Remove(row); _committed.Remove(row); }
         }
-
-        UpdateSnapshotCell(row, col, text);
-        _dirtyCells.Add((col, row));
-        _undo.Add(new EditCmd(new List<(int, int, string, string)> { (col, row, oldText, text) }));
-        _redo.Clear();
-        UpdateStats();
-        UpdateTitle();
-        if (_autoSaveCheck.Checked) CommitPending();
     }
 
     private void ApplyPlottedCellChange(int col, int row, string text)
@@ -1102,12 +1285,16 @@ public sealed class MainForm : Form
         if (_snapshot == null) return;
 
         var cells = _grid.SelectedCells.Cast<DataGridViewCell>()
-            .Where(c => c.RowIndex >= 0 && c.ColumnIndex > 0)
+            .Where(c => c.RowIndex >= 0 && c.ColumnIndex > 0 && c.ColumnIndex <= _snapshot.ColumnCount)
             .ToList();
         if (cells.Count == 0) return;
 
-        // 取选中单元格所属第一列（去掉“行号”列）
-        int tableCol = cells[0].ColumnIndex - 1;
+        // 取选中区域的“活动列”：优先当前单元格所在列，否则取选中数最多的列
+        int tableCol;
+        if (_grid.CurrentCell is { ColumnIndex: > 0 } cur && cur.ColumnIndex <= _snapshot.ColumnCount)
+            tableCol = cur.ColumnIndex - 1;
+        else
+            tableCol = cells.GroupBy(c => c.ColumnIndex).OrderByDescending(g => g.Count()).First().Key - 1;
 
         // 在“曲线列 (Y) 多选”完整列表里找到该列，高亮并滚动到可见区（不改变勾选）
         var allItems = _colsChecked.Items.Cast<CurveColumnOption>().ToList();
@@ -1134,6 +1321,700 @@ public sealed class MainForm : Form
         _syncFromGrid = false;
     }
 
+    // ---------- 网格：行列结构编辑 ----------
+    private void OnGridMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right) return;
+        var hit = _grid.HitTest(e.X, e.Y);
+        _gridTarget = hit.Type switch
+        {
+            DataGridViewHitTestType.ColumnHeader => (-1, hit.ColumnIndex, GridArea.ColumnHeader),
+            DataGridViewHitTestType.RowHeader => (hit.RowIndex, -1, GridArea.RowHeader),
+            DataGridViewHitTestType.Cell => (hit.RowIndex, hit.ColumnIndex, GridArea.Cell),
+            _ => (-1, -1, GridArea.None)
+        };
+    }
+
+    private void BuildGridContextMenu()
+    {
+        _gridMenu.Items.Clear();
+        var (row, col, area) = _gridTarget;
+        bool rowTarget = area != GridArea.ColumnHeader && row >= 0;
+        bool colTarget = !(area == GridArea.RowHeader) && col > 0;
+
+        if (rowTarget)
+        {
+            _gridMenu.Items.Add(MakeMenu("在上方插入行", "在选中行上方插入一个空行", () => InsertGridRow(row, false), false));
+            _gridMenu.Items.Add(MakeMenu("在下方插入行", "在选中行下方插入一个空行", () => InsertGridRow(row, true), false));
+            _gridMenu.Items.Add(MakeMenu("删除当前行", "删除选中行及其数据", () => DeleteGridRow(row), false));
+        }
+        if (rowTarget && colTarget)
+            _gridMenu.Items.Add(new ToolStripSeparator());
+        if (colTarget)
+        {
+            int physical = col - 1;
+            _gridMenu.Items.Add(MakeMenu("在左侧插入列", "在选中列左侧插入一个新列", () => InsertGridColumn(col, false), false));
+            _gridMenu.Items.Add(MakeMenu("在右侧插入列", "在选中列右侧插入一个新列", () => InsertGridColumn(col, true), false));
+            _gridMenu.Items.Add(MakeMenu("删除当前列", "删除选中列及其数据", () => DeleteGridColumn(col), false));
+            _gridMenu.Items.Add(MakeMenu("重命名列", "直接修改当前列表头（字段名）", () => BeginHeaderEdit(col), false));
+            _gridMenu.Items.Add(new ToolStripSeparator());
+            _gridMenu.Items.Add(BuildAlignMenu(physical));
+            _gridMenu.Items.Add(BuildHeaderAlignMenu(physical));
+        }
+        if (_gridMenu.Items.Count == 0)
+            _gridMenu.Items.Add(new ToolStripMenuItem("（无可操作项）") { Enabled = false });
+    }
+
+    private void BuildGridToolbarMenu()
+    {
+        _gridButton.DropDownItems.Clear();
+        if (_snapshot == null) return;
+        var cur = _grid.CurrentCell;
+        int row = _grid.CurrentRow?.Index ?? -1;
+        int col = cur?.ColumnIndex ?? -1;
+        bool hasRow = row >= 0;
+        bool hasCol = col > 0;
+        ToolStripMenuItem RowMenu(string text, string tip, Action action)
+        {
+            var m = MakeMenu(text, tip, action, false);
+            m.Enabled = hasRow;
+            return m;
+        }
+        ToolStripMenuItem ColMenu(string text, string tip, Action action)
+        {
+            var m = MakeMenu(text, tip, action, false);
+            m.Enabled = hasCol;
+            return m;
+        }
+        _gridButton.DropDownItems.Add(RowMenu("在上方插入行", "在当前行上方插入一个空行", () => InsertGridRow(row, false)));
+        _gridButton.DropDownItems.Add(RowMenu("在下方插入行", "在当前行下方插入一个空行", () => InsertGridRow(row, true)));
+        _gridButton.DropDownItems.Add(RowMenu("删除当前行", "删除当前行及其数据", () => DeleteGridRow(row)));
+        _gridButton.DropDownItems.Add(new ToolStripSeparator());
+        _gridButton.DropDownItems.Add(ColMenu("在左侧插入列", "在当前列左侧插入一个新列", () => InsertGridColumn(col, false)));
+        _gridButton.DropDownItems.Add(ColMenu("在右侧插入列", "在当前列右侧插入一个新列", () => InsertGridColumn(col, true)));
+        _gridButton.DropDownItems.Add(ColMenu("删除当前列", "删除当前列及其数据", () => DeleteGridColumn(col)));
+        _gridButton.DropDownItems.Add(ColMenu("重命名列", "直接修改当前列表头（字段名）", () => BeginHeaderEdit(col)));
+        _gridButton.DropDownItems.Add(new ToolStripSeparator());
+        if (hasCol)
+        {
+            _gridButton.DropDownItems.Add(BuildAlignMenu(col - 1));
+            _gridButton.DropDownItems.Add(BuildHeaderAlignMenu(col - 1));
+        }
+    }
+
+    /// <summary>构建“内容对齐”子菜单（只改列内容，不影响表头文字）。</summary>
+    private ToolStripMenuItem BuildAlignMenu(int physical)
+    {
+        var menu = new ToolStripMenuItem("内容对齐");
+        var cur = physical >= 0 && _snapshot != null && physical < _snapshot.ColumnAlignments.Count
+            ? _snapshot.ColumnAlignments[physical]
+            : HorizontalAlign.Default;
+        menu.DropDownItems.Add(MakeMenu("左对齐", "列内容靠左", () => SetColumnAlignment(physical, HorizontalAlign.Left), cur == HorizontalAlign.Left));
+        menu.DropDownItems.Add(MakeMenu("居中", "列内容居中", () => SetColumnAlignment(physical, HorizontalAlign.Center), cur == HorizontalAlign.Center));
+        menu.DropDownItems.Add(MakeMenu("右对齐", "列内容靠右", () => SetColumnAlignment(physical, HorizontalAlign.Right), cur == HorizontalAlign.Right));
+        return menu;
+    }
+
+    /// <summary>构建“表头对齐”子菜单（控制表头文字显示，保存时会写回 Excel）。</summary>
+    private ToolStripMenuItem BuildHeaderAlignMenu(int physical)
+    {
+        var menu = new ToolStripMenuItem("表头对齐");
+        var cur = physical >= 0 && _snapshot != null && physical < _snapshot.HeaderAlignments.Count
+            ? _snapshot.HeaderAlignments[physical]
+            : HorizontalAlign.Default;
+        // 表头默认即居中，因此 Default 在菜单中按“居中”显示
+        var shown = cur == HorizontalAlign.Default ? HorizontalAlign.Center : cur;
+        menu.DropDownItems.Add(MakeMenu("左对齐", "表头文字靠左", () => SetHeaderAlignment(physical, HorizontalAlign.Left), shown == HorizontalAlign.Left));
+        menu.DropDownItems.Add(MakeMenu("居中", "表头文字居中", () => SetHeaderAlignment(physical, HorizontalAlign.Center), shown == HorizontalAlign.Center));
+        menu.DropDownItems.Add(MakeMenu("右对齐", "表头文字靠右", () => SetHeaderAlignment(physical, HorizontalAlign.Right), shown == HorizontalAlign.Right));
+        return menu;
+    }
+
+    /// <summary>设置某列的内容对齐方式，并标记待写回 Excel 的整列数据单元格。</summary>
+    private void SetColumnAlignment(int physical, HorizontalAlign align)
+    {
+        if (_snapshot == null || physical < 0 || physical >= _snapshot.ColumnAlignments.Count) return;
+        _snapshot.ColumnAlignments[physical] = align;
+        _pendingColumnAlign.Add(physical);
+        int gridCol = physical + 1;
+        if (gridCol >= 0 && gridCol < _grid.Columns.Count)
+            _grid.Columns[gridCol].DefaultCellStyle.Alignment = MapAlign(align);
+        _grid.Refresh();
+        UpdateTitle();
+    }
+
+    /// <summary>设置某列表头文字的对齐方式，并标记待写回 Excel。</summary>
+    private void SetHeaderAlignment(int physical, HorizontalAlign align)
+    {
+        if (_snapshot == null || physical < 0 || physical >= _snapshot.Columns.Count) return;
+        _snapshot.HeaderAlignments[physical] = align;
+        _pendingHeaderAlign.Add(physical);
+        int gridCol = physical + 1;
+        if (gridCol >= 0 && gridCol < _grid.Columns.Count)
+            _grid.Columns[gridCol].HeaderCell.Style.Alignment = MapHeaderAlign(align);
+        _grid.Refresh();
+        UpdateTitle();
+    }
+
+    private void OnGridColumnHeaderDoubleClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.ColumnIndex <= 0) return;
+        BeginHeaderEdit(e.ColumnIndex);
+    }
+
+    /// <summary>在网格行 gridRow 的上方(false)/下方(true)插入空行。</summary>
+    private void InsertGridRow(int gridRow, bool below)
+    {
+        if (_snapshot == null) return;
+        int physical;
+        if (gridRow >= 0 && gridRow < _snapshot.RowNumbers.Count)
+            physical = _snapshot.RowNumbers[gridRow] + (below ? 1 : 0);
+        else
+            physical = (_snapshot.RowNumbers.Count > 0 ? _snapshot.RowNumbers[^1] : _snapshot.MaxRow) + 1;
+
+        _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.InsertRow, physical));
+        _structureQueued = true;
+        RemapRowKeys(physical, +1, false);
+        _snapshot.InsertRow(physical);
+        RebuildAfterStructure();
+    }
+
+    /// <summary>删除网格行 gridRow。</summary>
+    private void DeleteGridRow(int gridRow)
+    {
+        if (_snapshot == null || gridRow < 0 || gridRow >= _snapshot.RowNumbers.Count) return;
+        int physical = _snapshot.RowNumbers[gridRow];
+        _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.DeleteRow, physical));
+        _structureQueued = true;
+        RemapRowKeys(physical, 0, true);
+        _snapshot.DeleteRow(physical);
+        RebuildAfterStructure();
+    }
+
+    /// <summary>在网格列 gridCol 的左侧(false)/右侧(true)插入新列。</summary>
+    private void InsertGridColumn(int gridCol, bool right)
+    {
+        if (_snapshot == null || gridCol <= 0) return;
+        int physical = gridCol - 1 + (right ? 1 : 0);
+        physical = Math.Clamp(physical, 0, _snapshot.ColumnCount);
+        InsertColumnAtPhysical(physical, DefaultColumnName(physical));
+        RebuildAfterStructure(true);
+    }
+
+    /// <summary>删除网格列 gridCol。</summary>
+    private void DeleteGridColumn(int gridCol)
+    {
+        if (_snapshot == null || gridCol <= 0 || gridCol > _snapshot.ColumnCount) return;
+        int physical = gridCol - 1;
+        if (physical < 0 || physical >= _snapshot.Columns.Count) return;
+        _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.DeleteColumn, physical));
+        _structureQueued = true;
+        RemapColumnKeys(physical, 0, true);
+        _snapshot.DeleteColumn(physical);
+        RebuildAfterStructure(true);
+    }
+
+    /// <summary>在物理列 physical 处插入新列（含结构队列与快照平移），之后由调用方刷新。</summary>
+    private void InsertColumnAtPhysical(int physical, string header)
+    {
+        if (_snapshot == null) return;
+        physical = Math.Clamp(physical, 0, _snapshot.ColumnCount);
+        _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.InsertColumn, physical));
+        _structureQueued = true;
+        RemapColumnKeys(physical, +1, false);
+        _snapshot.InsertColumn(physical, header);
+    }
+
+    /// <summary>提交列名修改：更新快照并排队写回 Excel 表头。</summary>
+    private void CommitColumnRename(int physical, string text)
+    {
+        if (_snapshot == null || physical < 0 || physical >= _snapshot.Columns.Count) return;
+        var meta = _snapshot.Columns[physical];
+        if ((meta.HeaderRaw ?? "") == text) return;
+        _snapshot.RenameColumn(physical, text);
+        _pendingHeaderRename.RemoveAll(p => p.Col == physical);
+        _pendingHeaderRename.Add((physical, text));
+        RebuildAfterStructure(true);
+        _statusLabel.Text = $"已重命名列 {meta.Letter} → {text}";
+    }
+
+    private static string DefaultColumnName(int physical)
+        => "新列" + CellHelper.ColumnIndexToLetter(physical);
+
+    /// <summary>在当前网格列 gridCol 的表头位置弹出内联编辑框。</summary>
+    private void BeginHeaderEdit(int gridCol)
+    {
+        CommitHeaderEdit();
+        if (_snapshot == null || gridCol <= 0 || gridCol >= _grid.Columns.Count) return;
+        int physical = gridCol - 1;
+        if (physical < 0 || physical >= _snapshot.Columns.Count) return;
+
+        string current = _snapshot.Columns[physical].HeaderRaw ?? "";
+        var rect = _grid.GetCellDisplayRectangle(gridCol, -1, false);
+        var tb = new TextBox
+        {
+            Bounds = new Rectangle(rect.X, Math.Max(0, rect.Y), Math.Max(40, rect.Width), Math.Max(18, _grid.ColumnHeadersHeight)),
+            Text = current,
+            TextAlign = HorizontalAlignment.Center,
+            Font = _grid.Font,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Color.White,
+            Multiline = false
+        };
+        tb.KeyDown += OnHeaderEditKeyDown;
+        tb.Leave += OnHeaderEditLeave;
+        _grid.Controls.Add(tb);
+        tb.BringToFront();
+        _headerEdit = tb;
+        _headerEditPhysicalCol = physical;
+        tb.Focus();
+        tb.SelectAll();
+    }
+
+    private void OnHeaderEditKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Enter) { CommitHeaderEdit(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.Escape) { CancelHeaderEdit(); e.Handled = true; e.SuppressKeyPress = true; }
+    }
+
+    private void OnHeaderEditLeave(object? sender, EventArgs e) => CommitHeaderEdit();
+
+    /// <summary>提交内联列名编辑。</summary>
+    private void CommitHeaderEdit()
+    {
+        var tb = _headerEdit;
+        if (tb == null) return;
+        _headerEdit = null;
+        string text = tb.Text.Trim();
+        int physical = _headerEditPhysicalCol;
+        _headerEditPhysicalCol = -1;
+        tb.Dispose();
+
+        if (string.IsNullOrWhiteSpace(text) || physical < 0 || physical >= _snapshot!.Columns.Count) return;
+        CommitColumnRename(physical, text);
+    }
+
+    private void CancelHeaderEdit()
+    {
+        var tb = _headerEdit;
+        if (tb == null) return;
+        _headerEdit = null;
+        _headerEditPhysicalCol = -1;
+        tb.Dispose();
+    }
+
+    // ---------- 网格：剪贴板（Excel 式复制/剪切/粘贴/清除） ----------
+    /// <summary>当前选中的数据单元格（排除行号列），按行、列排序。</summary>
+    private List<(int Col, int Row, string Text)> SelectedDataCells()
+    {
+        var list = new List<(int Col, int Row, string Text)>();
+        if (_snapshot == null) return list;
+        foreach (var cell in _grid.SelectedCells.Cast<DataGridViewCell>())
+        {
+            if (cell.RowIndex < 0 || cell.ColumnIndex <= 0) continue;
+            int col = cell.ColumnIndex - 1;
+            int row = _snapshot.RowNumbers[cell.RowIndex];
+            list.Add((col, row, cell.Value?.ToString() ?? ""));
+        }
+        return list.OrderBy(c => c.Row).ThenBy(c => c.Col).ToList();
+    }
+
+    private void CopySelection()
+    {
+        var cells = SelectedDataCells();
+        if (cells.Count == 0) return;
+        int minR = cells.Min(c => c.Row), maxR = cells.Max(c => c.Row);
+        int minC = cells.Min(c => c.Col), maxC = cells.Max(c => c.Col);
+        var sb = new StringBuilder();
+        for (int r = minR; r <= maxR; r++)
+        {
+            if (r != minR) sb.Append("\r\n");
+            for (int c = minC; c <= maxC; c++)
+            {
+                if (c != minC) sb.Append('\t');
+                sb.Append(cells.FirstOrDefault(x => x.Row == r && x.Col == c).Text ?? "");
+            }
+        }
+        try { Clipboard.SetText(sb.ToString(), TextDataFormat.UnicodeText); _statusLabel.Text = $"已复制 {cells.Count} 个单元格"; }
+        catch { _statusLabel.Text = "复制失败：剪贴板暂不可用"; }
+    }
+
+    private void CutSelection()
+    {
+        CopySelection();
+        ClearSelection();
+        var cells = SelectedDataCells();
+        _statusLabel.Text = $"已剪切 {cells.Count} 个单元格";
+    }
+
+    private void ClearSelection()
+    {
+        var cells = SelectedDataCells();
+        if (cells.Count == 0) return;
+        var touched = ApplyCellEdits(cells.Select(c => (c.Col, c.Row, "")));
+        foreach (var (col, row) in touched)
+            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                _grid.Rows[gi].Cells[col + 1].Value = "";
+        _statusLabel.Text = $"已清除 {touched.Count} 个单元格";
+    }
+
+    private void PasteFromClipboard()
+    {
+        if (_snapshot == null) return;
+        string text;
+        try { text = Clipboard.GetText(); } catch { _statusLabel.Text = "读取剪贴板失败"; return; }
+        if (string.IsNullOrEmpty(text)) return;
+        var block = text.Replace("\r\n", "\n").Replace('\r', '\n')
+            .Split('\n')
+            .Select(l => l.Split('\t').ToList())
+            .ToList();
+        while (block.Count > 0 && block[^1].Count == 1 && block[^1][0].Length == 0)
+            block.RemoveAt(block.Count - 1);
+        if (block.Count == 0) return;
+
+        var anchor = _grid.CurrentCell;
+        int anchorGridRow = anchor?.RowIndex ?? (_grid.SelectedCells.Count > 0 ? _grid.SelectedCells[0].RowIndex : -1);
+        int anchorGridCol = anchor?.ColumnIndex ?? (_grid.SelectedCells.Count > 0 ? _grid.SelectedCells[0].ColumnIndex : -1);
+        if (anchorGridRow < 0 || anchorGridRow >= _snapshot.RowNumbers.Count || anchorGridCol <= 0) return;
+        if (anchorGridCol > _snapshot.ColumnCount) return;
+
+        int startCol = anchorGridCol - 1;
+        int startRowIndex = anchorGridRow;
+        var edits = new List<(int Col, int Row, string Text)>();
+        for (int r = 0; r < block.Count; r++)
+        {
+            int gridRow = startRowIndex + r;
+            if (gridRow >= _snapshot.RowNumbers.Count) break;
+            int row = _snapshot.RowNumbers[gridRow];
+            var line = block[r];
+            for (int c = 0; c < line.Count; c++)
+            {
+                int col = startCol + c;
+                if (col >= _snapshot.ColumnCount) break;
+                edits.Add((col, row, line[c]));
+            }
+        }
+        var touched = ApplyCellEdits(edits);
+        foreach (var (col, row) in touched)
+            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                _grid.Rows[gi].Cells[col + 1].Value = CellText(col, row);
+        _statusLabel.Text = $"已粘贴 {touched.Count} 个单元格";
+    }
+
+    /// <summary>结构改动后刷新列选择器与曲线/网格。</summary>
+    private void RefreshAfterStructure(bool columnsChanged = false)
+    {
+        if (_snapshot == null) return;
+        var opts = SubCurveHelper.BuildOptions(_snapshot!)
+            .Where(o => !ShouldHideColumn(o.Column))
+            .ToList();
+        var checkedKeys = _colsChecked.CheckedItems.Cast<CurveColumnOption>()
+            .Select(o => (o.Column.ColumnIndex, o.SubIndex, o.JsonIndex, o.JsonId, o.IsJsonValue))
+            .ToHashSet();
+        var xb = _xCombo.SelectedItem as CurveColumnOption;
+        var xKey = xb == null ? default((int, int, int, string, bool)?) : (xb.Column.ColumnIndex, xb.SubIndex, xb.JsonIndex, xb.JsonId, xb.IsJsonValue);
+
+        _suppressRebuild = true;
+        try
+        {
+            _colsChecked.Items.Clear();
+            _xCombo.Items.Clear();
+            _xCombo.Items.Add("行号");
+            foreach (var o in opts)
+            {
+                int idx = _colsChecked.Items.Add(o);
+                _colsChecked.SetItemChecked(idx, checkedKeys.Contains((o.Column.ColumnIndex, o.SubIndex, o.JsonIndex, o.JsonId, o.IsJsonValue)));
+                _xCombo.Items.Add(o);
+            }
+            int xSel = 0;
+            for (int i = 1; i < _xCombo.Items.Count; i++)
+                if (_xCombo.Items[i] is CurveColumnOption oo &&
+                    xKey.HasValue &&
+                    (oo.Column.ColumnIndex, oo.SubIndex, oo.JsonIndex, oo.JsonId, oo.IsJsonValue) == xKey.Value) { xSel = i; break; }
+            _xCombo.SelectedIndex = xSel >= 0 ? xSel : 0;
+        }
+        finally
+        {
+            _preferredListIndex = -1;
+            _preferredListChecked = false;
+            _suppressRebuild = false;
+        }
+        RebuildFromSelection();
+        HighlightEditableColumn();
+        UpdateTitle();
+    }
+
+    /// <summary>仅刷新列名，不丢任何未保存的改动或曲线状态。</summary>
+    private void RefreshColumnNames()
+    {
+        if (_busyLoading) return;
+        if (_wb == null || _snapshot == null || string.IsNullOrEmpty(_activeSheet)) return;
+
+        try
+        {
+            var fresh = _wb.LoadSheet(_activeSheet);
+            bool colsChanged = ColumnsChanged(fresh);
+            bool hasUnsaved = HasUnsavedChanges();
+
+            if (!hasUnsaved && colsChanged)
+            {
+                // 无未保存改动且列结构变化：安全重载整表，新列连同数据读取，曲线一并刷新。
+                _snapshot = fresh;
+                RefreshNumericFlagsFromData(_snapshot);
+                RefreshAfterStructure(true);
+                _statusLabel.Text = "已刷新列名";
+            }
+            else
+            {
+                // 有未保存改动，或列结构未变：只同步列名元信息与新列数据，不重载、不动曲线、不清改动。
+                SyncColumnHeaders(fresh);
+                RefreshNumericFlagsFromData(_snapshot);
+                RebuildColumnOptionsPreserve();
+                _statusLabel.Text = colsChanged
+                    ? "已刷新列名；当前有未保存改动，如需同步新列数据请先保存后再刷新"
+                    : "列名无变化。若新增了列，请先在 Excel 保存后再刷新列名";
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "刷新列名失败（文件可能被占用）：" + ex.Message;
+        }
+    }
+
+    /// <summary>比较磁盘最新快照与当前快照的列结构（列数或表头文本）是否变化。</summary>
+    private bool ColumnsChanged(SheetSnapshot fresh)
+    {
+        if (fresh.ColumnCount != _snapshot!.ColumnCount) return true;
+        for (int c = 0; c < fresh.ColumnCount; c++)
+            if (fresh.Columns[c].HeaderRaw != _snapshot.Columns[c].HeaderRaw) return true;
+        return false;
+    }
+
+    /// <summary>仅同步列名元信息到当前快照；列数增加时在末尾补列（不重载数据）。返回是否发生变化。</summary>
+    private bool SyncColumnHeaders(SheetSnapshot fresh)
+    {
+        var cur = _snapshot!;
+        bool changed = false;
+
+        int common = Math.Min(cur.ColumnCount, fresh.ColumnCount);
+        for (int c = 0; c < common; c++)
+        {
+            var src = fresh.Columns[c];
+            var dst = cur.Columns[c];
+            if (dst.HeaderRaw != src.HeaderRaw)
+            {
+                dst.HeaderRaw = src.HeaderRaw;
+                dst.Name = src.Name;
+                dst.Label = src.Label;
+                dst.Type = src.Type;
+                dst.IsEmpty = src.IsEmpty;
+                dst.IsNumericScalar = src.IsNumericScalar;
+                dst.IsInteger = src.IsInteger;
+                dst.NonEmptyCount = src.NonEmptyCount;
+                dst.NumericCount = src.NumericCount;
+                dst.TotalRows = src.TotalRows;
+                changed = true;
+            }
+        }
+
+        // 建物理行号 → 数据行的映射，用于把新增列在磁盘上的数据一并拷进来
+        var freshByRow = new Dictionary<int, string?[]>();
+        for (int fi = 0; fi < fresh.Grid.Count; fi++)
+            freshByRow[fresh.RowNumbers[fi]] = fresh.Grid[fi];
+
+        for (int c = cur.ColumnCount; c < fresh.ColumnCount; c++)
+        {
+            var meta = fresh.Columns[c];
+            for (int gi = 0; gi < cur.Grid.Count; gi++)
+            {
+                var old = cur.Grid[gi];
+                var nrow = new string?[old.Length + 1];
+                Array.Copy(old, nrow, old.Length);
+                if (freshByRow.TryGetValue(cur.RowNumbers[gi], out var frow) && c < frow.Length)
+                    nrow[^1] = frow[c];
+                cur.Grid[gi] = nrow;
+            }
+            cur.Columns.Add(meta);
+            cur.ColumnAlignments.Add(HorizontalAlign.Default);
+            cur.ColumnCount++;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>只重建列选择器与 X 轴下拉框并恢复勾选/选中，不触发曲线重建、不清空编辑状态。</summary>
+    private void RebuildColumnOptionsPreserve()
+    {
+        var opts = SubCurveHelper.BuildOptions(_snapshot!)
+            .Where(o => !ShouldHideColumn(o.Column))
+            .ToList();
+        var checkedKeys = _colsChecked.CheckedItems.Cast<CurveColumnOption>()
+            .Select(o => (o.Column.ColumnIndex, o.SubIndex, o.JsonIndex, o.JsonId, o.IsJsonValue))
+            .ToHashSet();
+        var xb = _xCombo.SelectedItem as CurveColumnOption;
+        var xKey = xb == null
+            ? default((int, int, int, string, bool)?)
+            : (xb.Column.ColumnIndex, xb.SubIndex, xb.JsonIndex, xb.JsonId, xb.IsJsonValue);
+
+        _suppressRebuild = true;
+        try
+        {
+            _colsChecked.Items.Clear();
+            _xCombo.Items.Clear();
+            _xCombo.Items.Add("行号");
+            foreach (var o in opts)
+            {
+                int idx = _colsChecked.Items.Add(o);
+                _colsChecked.SetItemChecked(idx, checkedKeys.Contains((o.Column.ColumnIndex, o.SubIndex, o.JsonIndex, o.JsonId, o.IsJsonValue)));
+                _xCombo.Items.Add(o);
+            }
+            int xSel = 0;
+            for (int i = 1; i < _xCombo.Items.Count; i++)
+                if (_xCombo.Items[i] is CurveColumnOption oo &&
+                    xKey.HasValue &&
+                    (oo.Column.ColumnIndex, oo.SubIndex, oo.JsonIndex, oo.JsonId, oo.IsJsonValue) == xKey.Value)
+                { xSel = i; break; }
+            _xCombo.SelectedIndex = xSel >= 0 ? xSel : 0;
+        }
+        finally
+        {
+            _preferredListIndex = -1;
+            _preferredListChecked = false;
+            _suppressRebuild = false;
+        }
+    }
+
+    /// <summary>
+    /// 根据当前快照的实际网格数据，重新判定每列是否为标量数值列 / 整数列。
+    /// 用于“刷新列名”时把新增（可能未保存到磁盘）的数值列识别出来。
+    /// 数组列、JSON 列、显式非数值类型列保持不变（由子曲线逻辑处理）。
+    /// </summary>
+    private void RefreshNumericFlagsFromData(SheetSnapshot snap)
+    {
+        for (int c = 0; c < snap.Columns.Count; c++)
+        {
+            var col = snap.Columns[c];
+            if (SubCurveHelper.IsArrayCol(col) || SubCurveHelper.IsJsonCol(col)) continue;
+
+            bool explicitNumeric = HeaderParser.IsExplicitNumericScalar(col.HeaderRaw, col.Type);
+            bool explicitInteger = HeaderParser.IsExplicitInteger(col.Type);
+            int nonEmpty = 0, numeric = 0;
+            bool allInteger = true;
+            for (int gi = 0; gi < snap.Grid.Count; gi++)
+            {
+                var row = snap.Grid[gi];
+                if (col.ColumnIndex < 0 || col.ColumnIndex >= row.Length) continue;
+                var raw = row[col.ColumnIndex];
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                nonEmpty++;
+                if (CellHelper.TryParseDouble(raw, out var d))
+                {
+                    numeric++;
+                    if (d != Math.Truncate(d)) allInteger = false;
+                }
+            }
+
+            bool isNumeric = explicitNumeric
+                || (string.IsNullOrEmpty(col.Type) && nonEmpty > 0 && (double)numeric / nonEmpty >= 0.7);
+            bool isInteger = explicitInteger
+                || (string.IsNullOrEmpty(col.Type) && allInteger && isNumeric);
+
+            col.IsNumericScalar = isNumeric;
+            col.IsInteger = isInteger;
+            col.NonEmptyCount = nonEmpty;
+            col.NumericCount = numeric;
+            col.TotalRows = snap.DataRowCount;
+        }
+    }
+
+    /// <summary>把结构改动后的网格重建延迟到消息循环，避免在控件事件回调中改动网格。</summary>
+    private void RebuildAfterStructure(bool columnsChanged = false)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        BeginInvoke(() => RefreshAfterStructure(columnsChanged));
+    }
+
+    /// <summary>行插入/删除后，平移 dirty 集合中的物理行号。delta=+1 插入，删除时用 delete=true。</summary>
+    private void RemapRowKeys(int fromPhysical, int delta, bool delete)
+    {
+        var newDirty = new HashSet<(int, int)>();
+        foreach (var (c, r) in _dirtyCells)
+        {
+            if (delete) { if (r == fromPhysical) continue; if (r > fromPhysical) newDirty.Add((c, r - 1)); else newDirty.Add((c, r)); }
+            else newDirty.Add((c, r >= fromPhysical ? r + delta : r));
+        }
+        _dirtyCells.Clear();
+        _dirtyCells.UnionWith(newDirty);
+
+        var newSub = new Dictionary<(int, int), string>();
+        foreach (var kv in _subEditOldText)
+        {
+            var (c, r) = kv.Key;
+            if (delete) { if (r == fromPhysical) continue; if (r > fromPhysical) newSub[(c, r - 1)] = kv.Value; else newSub[(c, r)] = kv.Value; }
+            else newSub[(c, r >= fromPhysical ? r + delta : r)] = kv.Value;
+        }
+        _subEditOldText.Clear();
+        foreach (var kv in newSub) _subEditOldText[kv.Key] = kv.Value;
+    }
+
+    /// <summary>列插入/删除后，平移 dirty 集合中的物理列号。delta=+1 插入，删除时用 delete=true。</summary>
+    private void RemapColumnKeys(int fromPhysical, int delta, bool delete)
+    {
+        var newDirty = new HashSet<(int, int)>();
+        foreach (var (c, r) in _dirtyCells)
+        {
+            if (delete) { if (c == fromPhysical) continue; if (c > fromPhysical) newDirty.Add((c - 1, r)); else newDirty.Add((c, r)); }
+            else newDirty.Add((c >= fromPhysical ? c + delta : c, r));
+        }
+        _dirtyCells.Clear();
+        _dirtyCells.UnionWith(newDirty);
+
+        var newSub = new Dictionary<(int, int), string>();
+        foreach (var kv in _subEditOldText)
+        {
+            var (c, r) = kv.Key;
+            if (delete) { if (c == fromPhysical) continue; if (c > fromPhysical) newSub[(c - 1, r)] = kv.Value; else newSub[(c, r)] = kv.Value; }
+            else newSub[(c >= fromPhysical ? c + delta : c, r)] = kv.Value;
+        }
+        _subEditOldText.Clear();
+        foreach (var kv in newSub) _subEditOldText[kv.Key] = kv.Value;
+
+        // 列增删也会平移之前记录的表头重命名目标列
+        if (delete)
+        {
+            _pendingHeaderRename.RemoveAll(p => p.Col == fromPhysical);
+            for (int i = 0; i < _pendingHeaderRename.Count; i++)
+                if (_pendingHeaderRename[i].Col > fromPhysical)
+                    _pendingHeaderRename[i] = (_pendingHeaderRename[i].Col - 1, _pendingHeaderRename[i].Text);
+        }
+        else
+        {
+            for (int i = 0; i < _pendingHeaderRename.Count; i++)
+                if (_pendingHeaderRename[i].Col >= fromPhysical)
+                    _pendingHeaderRename[i] = (_pendingHeaderRename[i].Col + delta, _pendingHeaderRename[i].Text);
+        }
+
+        // 列增删也平移待写回的表头对齐目标列
+        var newHeaderAlign = new HashSet<int>();
+        foreach (var c in _pendingHeaderAlign)
+        {
+            if (delete) { if (c == fromPhysical) continue; newHeaderAlign.Add(c > fromPhysical ? c - 1 : c); }
+            else newHeaderAlign.Add(c >= fromPhysical ? c + delta : c);
+        }
+        _pendingHeaderAlign.Clear();
+        _pendingHeaderAlign.UnionWith(newHeaderAlign);
+
+        var newColAlign = new HashSet<int>();
+        foreach (var c in _pendingColumnAlign)
+        {
+            if (delete) { if (c == fromPhysical) continue; newColAlign.Add(c > fromPhysical ? c - 1 : c); }
+            else newColAlign.Add(c >= fromPhysical ? c + delta : c);
+        }
+        _pendingColumnAlign.Clear();
+        _pendingColumnAlign.UnionWith(newColAlign);
+    }
+
     // ---------- 统计 ----------
     private void UpdateStats()
     {
@@ -1142,6 +2023,87 @@ public sealed class MainForm : Form
 
     // ---------- 批量 ----------
     private void OnApplyValue() { double v = (double)_valUpDown.Value; _curve.ApplyToSelected(p => (p.X, v)); }
+
+    /// <summary>
+    /// 填充整列空白：扫描当前编辑列的每个连续空白段，用左右相邻的有值单元格连成直线，
+    /// 对空白格做线性插值填入。与"高级拟合 直线 + 仅选中点(含空) + 过首尾两点"的思路一致，
+    /// 只是这里遍历整列的所有空白段，每段以左右有值格为首尾两点。
+    /// </summary>
+    private void FillBlanks()
+    {
+        if (_activeYColumn == null || _snapshot == null) return;
+        var snap = _snapshot;
+        var opt = _activeYColumn;
+
+        // 收集每个数据行的 (行号, X, 是否有Y值, Y值)。X 无法读取的行直接跳过（无法定位）。
+        var rows = new List<(int Row, double X, bool HasValue, double Y)>(snap.RowNumbers.Count);
+        for (int gi = 0; gi < snap.RowNumbers.Count; gi++)
+        {
+            int row = snap.RowNumbers[gi];
+            double x = row;
+            if (_xColumn != null)
+            {
+                if (!SubCurveHelper.TryReadValue(snap, _xColumn, gi, out var xv)) continue;
+                x = xv;
+            }
+            bool hasValue = SubCurveHelper.TryReadValue(snap, opt, gi, out var y);
+            rows.Add((row, x, hasValue, y));
+        }
+        if (rows.Count == 0) return;
+
+        var anchors = rows.Where(r => r.HasValue).ToList();
+        if (anchors.Count < 2)
+        {
+            _statusLabel.Text = "该列至少需要 2 个有值单元格才能填充空白";
+            return;
+        }
+
+        var writes = new List<(int Row, double X, double Y)>();
+
+        // 用一段直线（通过左右/前后两个有值格）为空白行取落点。before=true 表示填充前段（该直线左端之前的空白）。
+        void FillWithLine((int Row, double X, bool HasValue, double Y) pa, (int Row, double X, bool HasValue, double Y) pb, bool before)
+        {
+            if (Math.Abs(pb.X - pa.X) < 1e-12) return;
+            foreach (var r in rows)
+            {
+                bool inRange = before ? r.Row < pa.Row : r.Row > pb.Row;
+                if (!inRange || r.HasValue) continue;
+                double y = pa.Y + (pb.Y - pa.Y) * (r.X - pa.X) / (pb.X - pa.X);
+                if (!double.IsFinite(y)) continue;
+                writes.Add((r.Row, r.X, y));
+            }
+        }
+
+        // 前段空白：用开头两个有值格外推（首个有值格作右端、第二个作右端锚点外推）
+        FillWithLine(anchors[0], anchors[1], before: true);
+
+        // 内部空白段：相邻两个有值格之间
+        for (int i = 0; i < anchors.Count - 1; i++)
+        {
+            var a = anchors[i];
+            var b = anchors[i + 1];
+            if (Math.Abs(b.X - a.X) < 1e-12) continue;
+            foreach (var r in rows)
+                if (r.Row > a.Row && r.Row < b.Row && !r.HasValue)
+                {
+                    double y = a.Y + (b.Y - a.Y) * (r.X - a.X) / (b.X - a.X);
+                    if (!double.IsFinite(y)) continue;
+                    writes.Add((r.Row, r.X, y));
+                }
+        }
+
+        // 后段空白：用末尾两个有值格外推
+        FillWithLine(anchors[^2], anchors[^1], before: false);
+
+        if (writes.Count == 0)
+        {
+            _statusLabel.Text = "没有可填充的空白单元格";
+            return;
+        }
+        ApplyColumnFill(writes);
+        _statusLabel.Text = $"已填充 {writes.Count} 个空白单元格";
+    }
+
     private void OpenContextAtChart()
     {
         BuildContextMenu();
@@ -1170,6 +2132,21 @@ public sealed class MainForm : Form
     {
         var rand = new Random();
         _curve.ApplyToSelected(p => (p.X, p.Y + (rand.NextDouble() * 2 - 1) * amp));
+    }
+
+    /// <summary>平滑“选中的点”：与整列平滑不同，只对选中点序列做移动平均，非选中点不动。</summary>
+    private void BatchSmoothSelected()
+    {
+        var sel = _curve.GetSelectedPoints();
+        if (sel.Count < 3)
+        {
+            _statusLabel.Text = "请至少选择 3 个点再平滑";
+            return;
+        }
+        var sm = CurveMath.MovingAverage(sel.Select(p => p.Y).ToList(), 3);
+        int i = 0;
+        _curve.ApplyToSelected(p => (p.X, sm[i++]));
+        _statusLabel.Text = $"已平滑 {sel.Count} 个选中点";
     }
 
     // ---------- 撤销/重做 ----------
@@ -1301,6 +2278,10 @@ public sealed class MainForm : Form
         {
             _wb.RefreshMeta();
             _snapshot = _wb.LoadSheet(_activeSheet);
+            _pendingStructure.Clear();
+            _pendingHeaderRename.Clear();
+            _structureQueued = false;
+            _dirtyCells.Clear();
             RebuildFromSelection();
             _statusLabel.Text = "已从磁盘重新加载";
         }
@@ -1314,8 +2295,8 @@ public sealed class MainForm : Form
     private void SetGridSide(bool atRight)
     {
         _gridAtRight = atRight;
-        foreach (ToolStripMenuItem item in _layoutButton.DropDownItems) item.Checked = false;
-        ((ToolStripMenuItem)_layoutButton.DropDownItems[atRight ? 1 : 0]).Checked = true;
+        _gridBottomItem.Checked = !atRight;
+        _gridRightItem.Checked = atRight;
         _chartGridSplit.Orientation = atRight ? Orientation.Vertical : Orientation.Horizontal;
         try
         {
@@ -1324,6 +2305,58 @@ public sealed class MainForm : Form
         }
         catch { }
         SaveSettings();
+    }
+
+    // ---------- 表格最大化 / 还原 ----------
+    private void ToggleGridMaximize()
+    {
+        if (_gridMaximized) RestoreGrid();
+        else MaximizeGrid();
+    }
+
+    /// <summary>
+    /// 把表格（含底部工作表标签）从下方分隔面板取出，铺满主窗口中间区域，
+    /// 隐藏曲线、左右功能面板，便于专注编辑数据。
+    /// </summary>
+    private void MaximizeGrid()
+    {
+        if (_gridMaximized) return;
+        _gridMaximized = true;
+
+        // 从分隔面板中剥离，改挂到主窗体，并置于工具栏下方、状态栏上方
+        _chartGridSplit.Panel2.Controls.Remove(_gridPane);
+        Controls.Add(_gridPane);
+        _gridPane.Dock = DockStyle.Fill;
+        // 置为 z-order 最前，使工具栏、状态栏先按边停靠占据上下，表格再填充剩余中间区域，
+        // 避免表格顶部表头被工具栏遮住。
+        Controls.SetChildIndex(_gridPane, 0);
+
+        // 隐藏曲线与两侧功能面板，只留表格编辑区
+        _chartGridSplit.Visible = false;
+
+        UpdateLayoutMenu();
+    }
+
+    /// <summary>把表格放回原来的位置（下方/右侧分隔面板）。</summary>
+    private void RestoreGrid()
+    {
+        if (!_gridMaximized) return;
+        _gridMaximized = false;
+
+        Controls.Remove(_gridPane);
+        _chartGridSplit.Visible = true;
+        _chartGridSplit.Panel2.Controls.Add(_gridPane);
+        _gridPane.Dock = DockStyle.Fill;
+
+        UpdateLayoutMenu();
+    }
+
+    private void UpdateLayoutMenu()
+    {
+        _gridMaxItem.Text = _gridMaximized ? "还原表格" : "表格最大化";
+        _gridMaxItem.ToolTipText = _gridMaximized
+            ? "把表格还原到原来的位置（F11）"
+            : "把表格铺满主窗口，便于编辑数据（F11）";
     }
 
     // ---------- 右键菜单 ----------
@@ -1436,6 +2469,7 @@ public sealed class MainForm : Form
             var a = PromptDouble("扰动幅度（±）", 5);
             if (a.HasValue) { EnsureActiveHitSeries(); BatchRandom(a.Value); }
         });
+        AddBatch(menu, "曲线平滑", () => { EnsureActiveHitSeries(); BatchSmoothSelected(); });
         return menu;
     }
 
@@ -1554,12 +2588,80 @@ public sealed class MainForm : Form
     private void OpenAdvancedFit()
     {
         if (_fitDialog == null || _fitDialog.IsDisposed)
+        {
             _fitDialog = new FitDialog(_curve) { Owner = this };
+            _fitDialog.ColumnRowsProvider = GetColumnRowsForFill;
+            _fitDialog.ColumnFillApplier = ApplyColumnFill;
+        }
         if (!_fitDialog.Visible)
         {
             _fitDialog.Show();
             _fitDialog.BringToFront();
         }
+    }
+
+    /// <summary>返回当前编辑列整行（含空单元格）的物理行号与 X 值：默认 X=行号，设了 X 列则取该列值。</summary>
+    private IReadOnlyList<(int Row, double X)> GetColumnRowsForFill()
+    {
+        var list = new List<(int, double)>();
+        if (_snapshot == null || _activeYColumn == null) return list;
+        for (int gi = 0; gi < _snapshot.RowNumbers.Count; gi++)
+        {
+            int row = _snapshot.RowNumbers[gi];
+            double x = row;
+            if (_xColumn != null)
+            {
+                if (!SubCurveHelper.TryReadValue(_snapshot, _xColumn, gi, out var xv)) continue;
+                x = xv;
+            }
+            list.Add((row, x));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// 把“整列每格”的拟合结果写满当前编辑列（含原本为空的单元格），
+    /// 同步曲线点、快照与撤销栈，一次性提交一条撤销记录。
+    /// </summary>
+    private void ApplyColumnFill(IReadOnlyList<(int Row, double X, double Y)> writes)
+    {
+        if (_activeYColumn == null || _snapshot == null) return;
+        var opt = _activeYColumn;
+        int col = opt.Column.ColumnIndex;
+        var changed = new List<(int, int, string, string)>();
+
+        foreach (var (row, x, y) in writes)
+        {
+            if (col < 0 || col >= _snapshot.ColumnCount) continue;
+            if (!_rowToGridIndex.TryGetValue(row, out var gi) || gi < 0 || gi >= _snapshot.Grid.Count) continue;
+
+            // 曲线点始终按拟合值更新，且与单元格存储值保持一致（整数列取整），
+            // 否则仅改写“取整后发生变化”的行会让折线新旧值混杂，看起来就不是直线。
+            double chartY = !opt.IsSubCurve && opt.IsInteger ? Math.Round(y) : y;
+            _curve.SetSeriesPoint(_curve.ActiveSeriesIndex, row, x, chartY, _xColumn != null);
+
+            string oldText = CellText(col, row);
+            string newText = opt.IsSubCurve
+                ? SubCurveHelper.SetValue(oldText, opt, y)
+                : FormatCellValue(y, opt.IsInteger);
+            if (oldText == newText) continue;
+
+            UpdateSnapshotCell(row, col, newText);
+            _dirtyCells.Add((col, row));
+            _editing[row] = (x, chartY);
+            _committed[row] = (x, chartY);
+            changed.Add((col, row, oldText, newText));
+        }
+
+        if (changed.Count == 0) return;
+        _undo.Add(new EditCmd(changed));
+        _redo.Clear();
+        _pendingUndoRows.Clear();
+        UpdateGridCells(writes.Select(w => w.Row).ToArray());
+        UpdateStats();
+        UpdateTitle();
+        _curve.Invalidate();
+        if (_autoSaveCheck.Checked) { _autoSaveTimer.Stop(); _autoSaveTimer.Start(); }
     }
 
     private double? PromptDouble(string title, double defaultValue)
@@ -1675,6 +2777,14 @@ public sealed class MainForm : Form
         _ => DataGridViewContentAlignment.MiddleLeft
     };
 
+    /// <summary>表头对齐映射：未设置或居中时默认居中，与全局表头样式保持一致。</summary>
+    private static DataGridViewContentAlignment MapHeaderAlign(HorizontalAlign a) => a switch
+    {
+        HorizontalAlign.Left => DataGridViewContentAlignment.MiddleLeft,
+        HorizontalAlign.Right => DataGridViewContentAlignment.MiddleRight,
+        _ => DataGridViewContentAlignment.MiddleCenter
+    };
+
     private static ToolStripMenuItem MakeMenu(string text, string tooltip, Action onClick, bool check)
     {
         var m = new ToolStripMenuItem(text) { Checked = check, CheckOnClick = false };
@@ -1741,7 +2851,7 @@ public sealed class MainForm : Form
         Tip(_scaleUpDown, "对选中点整体放大/缩小的倍数（配合“缩放 ×”按钮）");
         Tip(_clampMin, "钳制最小值");
         Tip(_clampMax, "钳制最大值");
-        Tip(_randUpDown, "随机扰动幅度（±，配合“随机扰动”按钮）");
+        Tip(_randUpDown, "随机扰动幅度（±，配合“随机扰动(选中点)”按钮）");
         Tip(_statLabel, "当前编辑列的统计信息（最大/平均/总和/标准差等）");
     }
 
