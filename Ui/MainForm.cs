@@ -62,6 +62,9 @@ public sealed class MainForm : Form
     private readonly ComboBox _fitTypeCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly NumericUpDown _fitDegree = new() { DecimalPlaces = 0, Minimum = 2, Maximum = 8, Value = 2 };
     private readonly Label _fitInfo = new() { AutoSize = false, Height = 84, Font = new Font("Microsoft YaHei UI", 7.5f), ForeColor = Color.FromArgb(70, 76, 84) };
+    private FitDialog? _fitDialog;
+    private SplashForm? _splash;
+    private bool _busyLoading;
     private Panel _gridPane = null!;
     private readonly Panel _rightPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
     private readonly Panel _leftPanel = new() { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
@@ -89,6 +92,18 @@ public sealed class MainForm : Form
     private string _activeSheet = "";
     private string _autoFocusSheet = "";
     private int _autoFocusCol = -1;
+    private sealed class SheetLoadData
+    {
+        public SheetSnapshot? Snapshot;
+        public List<CurveColumnOption> CurveOptions = new();
+        public string? Error;
+    }
+    private sealed record OpenPrepared(
+        WorkbookModel Wb,
+        (string Sheet, ColumnMeta Col)? Best,
+        string TargetSheet,
+        SheetLoadData TargetLoad,
+        string? Error);
 
     private readonly System.Windows.Forms.Timer _autoSaveTimer = new() { Interval = 600 };
     private readonly System.Windows.Forms.Timer _reloadTimer = new() { Interval = 600 };
@@ -111,6 +126,8 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1150, 720);
         Font = new Font("Microsoft YaHei UI", 9f);
+        // 显示前就设为最大化，避免先出现默认小窗再“闪大”
+        WindowState = FormWindowState.Maximized;
 
         BuildUi();
         BuildEvents();
@@ -268,6 +285,7 @@ public sealed class MainForm : Form
         fitButtons.Controls.Add(MakeButton("应用", OnFitApply));
         fitButtons.Controls.Add(MakeButton("清除", ClearFitPreview));
         R(fitButtons, 30);
+        R(MakeButton("高级拟合...", OpenAdvancedFit), 30);
         R(_fitInfo, 88);
         R(MakeButton("右键更多操作", OpenContextAtChart), 30);
         ry += 10;
@@ -375,7 +393,6 @@ public sealed class MainForm : Form
     // ---------- 打开 / 工作表 ----------
     private void OnShown()
     {
-        WindowState = _settings.Maximized ? FormWindowState.Maximized : FormWindowState.Normal;
         _chartArea.ColumnStyles[0].Width = Math.Clamp(_settings.LeftWidth, LeftPanelWidth, 460);
         _chartArea.ColumnStyles[2].Width = Math.Clamp(_settings.RightWidth, RightPanelWidth, 460);
         SetGridSide(_settings.GridAtRight);
@@ -402,23 +419,129 @@ public sealed class MainForm : Form
 
     private void OpenFile(string path)
     {
-        _wb?.Dispose();
-        _wb = new WorkbookModel();
-        try { _wb.Open(path); }
+        if (_busyLoading) return;
+        _busyLoading = true;
+        ShowSplash("正在打开 " + Path.GetFileName(path) + " ...");
+        Task.Run(() => PrepareOpen(path))
+            .ContinueWith(t => BeginInvokeSafe(() => FinishOpen(path, t.Result)), TaskScheduler.Default);
+    }
+
+    private static OpenPrepared PrepareOpen(string path)
+    {
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(path);
+            var best = FindBestDataColumn(wb);
+            string target = best?.Sheet ?? wb.SheetNames.FirstOrDefault(s => !ShouldHideSheet(s)) ?? "";
+            var tl = LoadSheetDataSync(wb, target);
+            return new OpenPrepared(wb, best, target, tl, null);
+        }
         catch (Exception ex)
         {
-            MessageBox.Show(this, "无法打开文件：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return new OpenPrepared(null!, null, "", new SheetLoadData { Error = ex.Message }, ex.Message);
+        }
+    }
+
+    private void FinishOpen(string path, OpenPrepared prep)
+    {
+        _busyLoading = false;
+        if (prep.Error != null)
+        {
+            MessageBox.Show(this, "无法打开文件：\n" + prep.Error, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            CloseSplash();
             return;
         }
+        _wb?.Dispose();
+        _wb = prep.Wb;
         _settings.LastFile = path;
         SetupWatcher(path);
         BuildSheetStrip();
-        var best = FindBestDataColumn();
-        var target = best?.Sheet ?? _wb.SheetNames.FirstOrDefault(s => !ShouldHideSheet(s)) ?? "";
-        _autoFocusSheet = best?.Sheet ?? "";
-        _autoFocusCol = best?.Col.ColumnIndex ?? -1;
-        ActivateSheet(target);
+        _autoFocusSheet = prep.Best?.Sheet ?? "";
+        _autoFocusCol = prep.Best?.Col.ColumnIndex ?? -1;
+        _activeSheet = prep.TargetSheet;
+        HighlightActiveSheet();
+        ApplySheetData(prep.TargetLoad);
         UpdateTitle();
+        CloseSplash();
+    }
+
+    private void StartSheetLoad(string name)
+    {
+        if (_busyLoading || _wb == null) return;
+        _busyLoading = true;
+        _statusLabel.Text = "正在加载工作表 " + name + " ...";
+        var wb = _wb;
+        Task.Run(() => LoadSheetDataSync(wb, name))
+            .ContinueWith(t => BeginInvokeSafe(() =>
+            {
+                _busyLoading = false;
+                ApplySheetData(t.Result);
+            }), TaskScheduler.Default);
+    }
+
+    private static SheetLoadData LoadSheetDataSync(WorkbookModel wb, string sheet)
+    {
+        var d = new SheetLoadData();
+        try
+        {
+            d.Snapshot = wb.LoadSheet(sheet);
+            d.CurveOptions = SubCurveHelper.BuildOptions(d.Snapshot)
+                .Where(o => !ShouldHideColumn(o.Column))
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            d.Error = ex.Message;
+        }
+        return d;
+    }
+
+    private void ApplySheetData(SheetLoadData d)
+    {
+        if (d.Error != null)
+        {
+            _statusLabel.Text = "读取工作表失败：" + d.Error;
+            return;
+        }
+        _snapshot = d.Snapshot;
+        var curveOptions = d.CurveOptions;
+        _autoFocusCol = -1;
+        _colsChecked.Items.Clear();
+        foreach (var o in curveOptions) _colsChecked.Items.Add(o);
+        _xCombo.Items.Clear();
+        _xCombo.Items.Add("行号");
+        foreach (var o in curveOptions) _xCombo.Items.Add(o);
+        _xCombo.SelectedIndex = 0;
+        RebuildFromSelection();
+        _statusLabel.Text = $"已加载 [{_activeSheet}]：{d.Snapshot!.DataRowCount} 行 × {d.Snapshot.ColumnCount} 列，曲线子列 {curveOptions.Count} 条";
+    }
+
+    private void BeginInvokeSafe(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(action); }
+        catch { }
+    }
+
+    private void ShowSplash(string text)
+    {
+        if (_splash == null || _splash.IsDisposed)
+            _splash = new SplashForm();
+        _splash.SetText(text);
+        if (!_splash.Visible) _splash.Show();
+        _splash.BringToFront();
+        _splash.Update();
+    }
+
+    private void CloseSplash()
+    {
+        if (_splash != null && !_splash.IsDisposed)
+        {
+            _splash.Hide();
+            _splash.Dispose();
+        }
+        _splash = null;
     }
 
     /// <summary>判断是否为“序号 / 主键”列，默认选中时应跳过。</summary>
@@ -437,15 +560,15 @@ public sealed class MainForm : Form
     private static bool ShouldHideSheet(string name)
         => name.Contains("111", StringComparison.OrdinalIgnoreCase);
 
-    private (string Sheet, ColumnMeta Col)? FindBestDataColumn()
+    private static (string Sheet, ColumnMeta Col)? FindBestDataColumn(WorkbookModel wb)
     {
-        if (_wb == null) return null;
+        if (wb == null) return null;
         (string Sheet, ColumnMeta Col, int Count)? best = null;
-        foreach (var sheet in _wb.SheetNames)
+        foreach (var sheet in wb.SheetNames)
         {
             if (ShouldHideSheet(sheet)) continue;
             SheetSnapshot sn;
-            try { sn = _wb.LoadSheet(sheet); } catch { continue; }
+            try { sn = wb.LoadSheet(sheet); } catch { continue; }
             foreach (var col in sn.Columns.Where(c => c.IsNumericScalar))
             {
                 if (IsOrdinalColumn(col) || ShouldHideColumn(col)) continue;
@@ -511,7 +634,7 @@ public sealed class MainForm : Form
         _activeSheet = name;
         _autoFocusCol = name == _autoFocusSheet ? _autoFocusCol : -1;
         HighlightActiveSheet();
-        LoadSheetAndColumns();
+        StartSheetLoad(name);
     }
 
     private bool HasUnsavedChanges() => _dirtyCells.Count > 0;
@@ -526,29 +649,6 @@ public sealed class MainForm : Form
         _undo.Clear();
         _redo.Clear();
         UpdateTitle();
-    }
-
-    private void LoadSheetAndColumns()
-    {
-        if (_wb == null || string.IsNullOrEmpty(_activeSheet)) return;
-        try { _snapshot = _wb.LoadSheet(_activeSheet); }
-        catch (Exception ex) { _statusLabel.Text = "读取工作表失败：" + ex.Message; return; }
-
-        var nums = _snapshot.Columns.Where(c => c.IsNumericScalar && !ShouldHideColumn(c)).ToList();
-        var curveOptions = SubCurveHelper.BuildOptions(_snapshot)
-            .Where(o => !ShouldHideColumn(o.Column))
-            .ToList();
-        _colsChecked.Items.Clear();
-        foreach (var o in curveOptions) _colsChecked.Items.Add(o);
-        _autoFocusCol = -1;
-
-        _xCombo.Items.Clear();
-        _xCombo.Items.Add("行号");
-        foreach (var o in curveOptions) _xCombo.Items.Add(o);
-        _xCombo.SelectedIndex = 0;
-
-        RebuildFromSelection();
-        _statusLabel.Text = $"已加载 [{_activeSheet}]：{_snapshot.DataRowCount} 行 × {_snapshot.ColumnCount} 列，曲线子列 {curveOptions.Count} 条";
     }
 
     private void RebuildFromSelection()
@@ -1195,6 +1295,7 @@ public sealed class MainForm : Form
 
     private void ReloadFromDisk()
     {
+        if (_busyLoading) return;
         if (_wb == null || string.IsNullOrEmpty(_activeSheet)) return;
         try
         {
@@ -1262,6 +1363,9 @@ public sealed class MainForm : Form
         _menu.Items.Add(new ToolStripSeparator());
         if (_curve.SelectedCount >= 2)
             _menu.Items.Add(BuildFitMenu());
+        var adv = new ToolStripMenuItem("高级拟合...");
+        adv.Click += (s, e) => OpenAdvancedFit();
+        _menu.Items.Add(adv);
         _menu.Items.Add(BuildBatchMenu());
         var stats = new ToolStripMenuItem("查看统计");
         stats.Click += (s, e) => MessageBox.Show(this, _statLabel.Text, "当前编辑列统计", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1447,6 +1551,17 @@ public sealed class MainForm : Form
         _fitInfo.Text = $"{r.Label}{Environment.NewLine}{r.Formula}{Environment.NewLine}R²={r.R2:0.###}  RMSE={r.RMSE:0.###}";
     }
 
+    private void OpenAdvancedFit()
+    {
+        if (_fitDialog == null || _fitDialog.IsDisposed)
+            _fitDialog = new FitDialog(_curve) { Owner = this };
+        if (!_fitDialog.Visible)
+        {
+            _fitDialog.Show();
+            _fitDialog.BringToFront();
+        }
+    }
+
     private double? PromptDouble(string title, double defaultValue)
     {
         using var f = new Form
@@ -1515,6 +1630,8 @@ public sealed class MainForm : Form
         _watcher?.Dispose();
         _autoSaveTimer.Stop();
         _reloadTimer.Stop();
+        _fitDialog?.Dispose();
+        CloseSplash();
         SaveSettings();
         _wb?.Dispose();
         base.OnFormClosing(e);

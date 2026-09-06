@@ -37,6 +37,7 @@ public sealed class CurveEditor : Control
     private bool _spaceDown;
     private Point _mouseDown;
     private int _hoverIndex = -1;
+    private int _selectAnchor = -1;  // Shift 范围选择的起点索引
     private bool _additiveSelect;
     private Rectangle _marquee;
 
@@ -94,6 +95,7 @@ public sealed class CurveEditor : Control
         foreach (var s in series) _series.Add(s);
         ActiveSeriesIndex = activeIndex;
         _selected.Clear();
+        _selectAnchor = -1;
         _hasView = false;
         AutoFitView();
         Invalidate();
@@ -103,6 +105,7 @@ public sealed class CurveEditor : Control
     {
         ActiveSeriesIndex = index;
         _selected.Clear();
+        _selectAnchor = -1;
         if (autoFit)
         {
             _hasView = false;
@@ -213,6 +216,7 @@ public sealed class CurveEditor : Control
     {
         if (_selected.Count == 0) return;
         _selected.Clear();
+        _selectAnchor = -1;
         Invalidate();
         SelectionChanged?.Invoke();
     }
@@ -229,6 +233,7 @@ public sealed class CurveEditor : Control
         var list = ActiveSeries?.Points;
         if (list == null) return;
         _selected.Clear();
+        _selectAnchor = -1;
         for (int i = 0; i < list.Count; i++) _selected.Add(i);
         Invalidate();
         SelectionChanged?.Invoke();
@@ -238,6 +243,7 @@ public sealed class CurveEditor : Control
     public void SelectPointByRow(int row)
     {
         _selected.Clear();
+        _selectAnchor = -1;
         var list = ActiveSeries?.Points;
         if (list != null)
             for (int i = 0; i < list.Count; i++)
@@ -252,6 +258,7 @@ public sealed class CurveEditor : Control
         var list = ActiveSeries?.Points;
         if (list == null) return;
         if (!additive) _selected.Clear();
+        _selectAnchor = -1;
         foreach (var row in rows)
             for (int i = 0; i < list.Count; i++)
                 if (list[i].RowNumber == row) { _selected.Add(i); break; }
@@ -592,15 +599,31 @@ public sealed class CurveEditor : Control
             SetActiveSeries(hitSeries, autoFit: false);
         int hit = hitAny ? hitPoint : -1;
         bool ctrl = (ModifierKeys & Keys.Control) != 0;
+        bool shift = (ModifierKeys & Keys.Shift) != 0;
         if (hit >= 0)
         {
+            if (shift)
+            {
+                // Shift 范围选择：从锚点到当前点击点之间的所有点
+                if (_selectAnchor < 0)
+                    _selectAnchor = _selected.Count > 0 ? _selected.First() : hit;
+                if (_selected.Count == 0) _selectAnchor = hit;
+                int lo = Math.Min(_selectAnchor, hit), hi = Math.Max(_selectAnchor, hit);
+                _selected.Clear();
+                for (int i = lo; i <= hi; i++) _selected.Add(i);
+                Invalidate();
+                SelectionChanged?.Invoke();
+                return;
+            }
             if (ctrl)
             {
+                _selectAnchor = hit;
                 if (!_selected.Add(hit)) _selected.Remove(hit);
                 Invalidate();
                 SelectionChanged?.Invoke();
                 return;
             }
+            _selectAnchor = hit;
             if (!_selected.Contains(hit))
             {
                 _selected.Clear();
@@ -623,6 +646,7 @@ public sealed class CurveEditor : Control
             if (!ctrl)
             {
                 _selected.Clear();
+                _selectAnchor = -1;
                 SelectionChanged?.Invoke();
             }
             _drag = DragMode.Marquee;
@@ -725,6 +749,7 @@ public sealed class CurveEditor : Control
                     SelectionChanged?.Invoke();
                 }
             }
+            _selectAnchor = -1; // 框选后放弃 Shift 范围锚点
             Invalidate();
             SelectionChanged?.Invoke();
         }
