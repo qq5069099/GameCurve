@@ -4,7 +4,13 @@
     <_LastSelectedProfileId>C:\Users\50690\Desktop\github\GameCurve\Properties\PublishProfiles\FolderProfile.pubxml</_LastSelectedProfileId>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Update="Ui\FitDialog.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Update="Ui\MainForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Update="Ui\SplashForm.cs">
       <SubType>Form</SubType>
     </Compile>
   </ItemGroup>

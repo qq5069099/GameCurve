@@ -18,6 +18,14 @@ internal static class TestHarness
             return StructureTest(args);
         if (args.Length > 1 && args[1] == "--columnorder")
             return ColumnOrderTest(args);
+        if (args.Length > 1 && args[1] == "--columnwidth")
+            return ColumnWidthTest(args);
+        if (args.Length > 1 && args[1] == "--sheetorder")
+            return SheetOrderTest(args);
+        if (args.Length > 1 && args[1] == "--addsheet")
+            return AddSheetTest(args);
+        if (args.Length > 1 && args[1] == "--renamesheet")
+            return RenameSheetTest(args);
 
         string file = args.Length > 1 && File.Exists(args[1])
             ? args[1]
@@ -166,12 +174,28 @@ internal static class TestHarness
         bool memRename = orig.Columns[0].HeaderRaw == "renamed:A" && !orig.Columns[0].IsEmpty;
         Console.WriteLine($"内存行操作: {(memRow && memRowBack ? "OK" : "失败")}; 内存列操作: {(memCol && memColBack ? "OK" : "失败")}; 重命名: {(memRename ? "OK" : "失败")}");
 
+        // 5) 批量插入多行：一次插入 count 个空行，验证行数净增 count、原数据下移 count 行
+        int count = 7;
+        int batchInsert = insertRow; // 在原来有数据的行位置插入
+        bool okBatch = wb.TryApplyStructure(
+            Enumerable.Range(0, count).Select(_ => new StructuralOp(sheet, StructuralKind.InsertRow, batchInsert)).ToList(),
+            out var errBatch);
+        wb.RefreshMeta();
+        var s5 = wb.LoadSheet(sheet);
+        bool batchOk = okBatch
+            && s5.RowNumbers.Count == snap.RowNumbers.Count + count
+            && s5.Grid[s5.RowNumbers.IndexOf(batchInsert + count)][probeCol] == beforeVal
+            && Enumerable.Range(0, count).All(i =>
+                s5.RowNumbers.Contains(batchInsert + i) &&
+                (s5.Grid[s5.RowNumbers.IndexOf(batchInsert + i)][probeCol] ?? "") == "");
+        Console.WriteLine($"批量插入 {count} 行: {(batchOk ? "OK" : "失败")}");
+
         using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
         bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
         Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
 
         try { File.Delete(copy); } catch { }
-        return rowShifted && restored && colRestored && memRow && memRowBack && memCol && memColBack && memRename ? 0 : 3;
+        return rowShifted && restored && colRestored && memRow && memRowBack && memCol && memColBack && memRename && batchOk ? 0 : 3;
     }
 
     private static int ColumnOrderTest(string[] args)
@@ -205,6 +229,243 @@ internal static class TestHarness
             bool orderOk = read != null && read.SequenceEqual(order);
             Console.WriteLine("重读列顺序: " + (orderOk ? "OK" : "失败 " + (read == null ? "null" : string.Join(",", read))));
             allOk &= hiddenFiltered && orderOk;
+
+            using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+            bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+            allOk &= hasVba;
+        }
+        finally
+        {
+            wb2?.Dispose();
+            try { File.Delete(copy); } catch { }
+        }
+        return allOk ? 0 : 3;
+    }
+
+    private static int ColumnWidthTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm";
+        Console.WriteLine("列宽测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_colwidth_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        bool allOk = true;
+        WorkbookModel? wb2 = null;
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(copy);
+            string sheet = wb.SheetNames.First();
+            var snap = wb.LoadSheet(sheet);
+            Console.WriteLine("读取原始列宽（字符单位）:");
+            for (int c = 0; c < snap.ColumnCount; c++)
+                Console.WriteLine($"  col{c} ({CellHelper.ColumnIndexToLetter(c)}) = {snap.Columns[c].Width?.ToString("0.##") ?? "null"}");
+
+            // 写回一组新的列宽（每列互不相同，覆盖所有列）
+            var widths = new List<(int Col, double Width)>();
+            for (int c = 0; c < snap.ColumnCount; c++)
+                widths.Add((c, 10.0 + c * 1.5));
+            bool writeOk = wb.TryWriteColumnWidths(sheet, widths, out var err);
+            Console.WriteLine("写列宽: " + (writeOk ? "OK" : "失败 " + err));
+            if (!writeOk) return 3;
+            wb.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            var snap2 = wb2.LoadSheet(sheet);
+            bool allMatch = true;
+            for (int c = 0; c < snap2.ColumnCount; c++)
+            {
+                double expect = 10.0 + c * 1.5;
+                double? actual = snap2.Columns[c].Width;
+                if (actual == null || Math.Abs(actual.Value - expect) > 1e-6)
+                {
+                    string actualStr = actual.HasValue ? actual.Value.ToString("0.##") : "null";
+                    Console.WriteLine($"  col{c} 期望 {expect.ToString("0.##")} 实际 {actualStr} -> 不一致");
+                    allMatch = false;
+                }
+            }
+            Console.WriteLine("重读列宽一致: " + (allMatch ? "OK" : "失败"));
+            allOk &= allMatch;
+
+            // 只写部分列，验证其它列被保留
+            var partial = new List<(int, double)> { (0, 42.0) };
+            bool partialOk = wb2.TryWriteColumnWidths(sheet, partial, out var errP);
+            Console.WriteLine("写部分列宽: " + (partialOk ? "OK" : "失败 " + errP));
+            wb2.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            var snap3 = wb2.LoadSheet(sheet);
+            bool partialPreserved = Math.Abs((snap3.Columns[0].Width ?? 0) - 42.0) < 1e-6
+                && Math.Abs((snap3.Columns[snap3.ColumnCount - 1].Width ?? 0) - (10.0 + (snap3.ColumnCount - 1) * 1.5)) < 1e-6;
+            Console.WriteLine("部分写回时其它列保留: " + (partialPreserved ? "OK" : "失败"));
+            allOk &= partialPreserved;
+
+            using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+            bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+            allOk &= hasVba;
+        }
+        finally
+        {
+            wb2?.Dispose();
+            try { File.Delete(copy); } catch { }
+        }
+        return allOk ? 0 : 3;
+    }
+
+    private static int SheetOrderTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\Base@全局数据.xlsm";
+        Console.WriteLine("工作表顺序测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_sheetorder_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        bool allOk = true;
+        WorkbookModel? wb2 = null;
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(copy);
+            var names = wb.SheetNames.ToList();
+            var order = names.AsEnumerable().Reverse().ToList(); // 倒序
+            bool writeOk = wb.TryWriteSheetOrder(order, out var err);
+            Console.WriteLine("写工作表顺序: " + (writeOk ? "OK" : "失败 " + err));
+            if (!writeOk) return 3;
+            // 再写一个列顺序，验证不会把工作表顺序覆盖掉
+            string first = names.First();
+            int colCount = wb.LoadSheet(first).ColumnCount;
+            var colOrder = Enumerable.Range(0, colCount).Reverse().ToList();
+            bool colOk = wb.TryWriteColumnOrder(first, colOrder, out var errCol);
+            Console.WriteLine("写列顺序（应保留工作表顺序）: " + (colOk ? "OK" : "失败 " + errCol));
+            wb.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            var read = wb2.GetSheetDisplayOrder();
+            bool orderOk = read != null && read.SequenceEqual(order);
+            Console.WriteLine("重读工作表顺序: " + (orderOk ? "OK" : "失败 " + (read == null ? "null" : string.Join(",", read))));
+            allOk &= orderOk;
+
+            using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+            bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+            allOk &= hasVba;
+        }
+        finally
+        {
+            wb2?.Dispose();
+            try { File.Delete(copy); } catch { }
+        }
+        return allOk ? 0 : 3;
+    }
+
+    private static int AddSheetTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm";
+        Console.WriteLine("新建工作表测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_addsheet_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        bool allOk = true;
+        WorkbookModel? wb2 = null;
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(copy);
+            int before = wb.SheetNames.Count;
+            bool addOk = wb.TryAddSheet("新表99", out var err);
+            Console.WriteLine("新建工作表: " + (addOk ? "OK" : "失败 " + err));
+            if (!addOk) return 3;
+            bool exists = wb.SheetNames.Contains("新表99", StringComparer.OrdinalIgnoreCase);
+            Console.WriteLine(("新建后存在于列表: " + (exists ? "OK" : "失败")));
+            var snap = wb.LoadSheet("新表99");
+            bool usable = snap.ColumnCount >= 1 && snap.DataRowCount >= 1;
+            Console.WriteLine("新表可加载且有列/行: " + (usable ? "OK" : "失败"));
+            wb.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            bool exists2 = wb2.SheetNames.Count == before + 1
+                && wb2.SheetNames.Contains("新表99", StringComparer.OrdinalIgnoreCase);
+            Console.WriteLine("关闭后重读仍存在: " + (exists2 ? "OK" : "失败"));
+            allOk &= exists && usable && exists2;
+
+            using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+            bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+            allOk &= hasVba;
+        }
+        finally
+        {
+            wb2?.Dispose();
+            try { File.Delete(copy); } catch { }
+        }
+        return allOk ? 0 : 3;
+    }
+
+    private static int RenameSheetTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm";
+        Console.WriteLine("重命名工作表测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_renamesheet_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        bool allOk = true;
+        WorkbookModel? wb2 = null;
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(copy);
+            string oldName = wb.SheetNames.First();
+            string newName = "重命名测试表";
+            // 先写入列顺序与工作表顺序，验证改名会同步迁移两种顺序
+            int colCount = wb.LoadSheet(oldName).ColumnCount;
+            var colOrder = Enumerable.Range(0, colCount).Reverse().ToList();
+            bool colOk = wb.TryWriteColumnOrder(oldName, colOrder, out var errCol);
+            var sheetOrder = wb.SheetNames.ToList();
+            bool orderOk = wb.TryWriteSheetOrder(sheetOrder, out var errOrder);
+            Console.WriteLine("预写列顺序: " + (colOk ? "OK" : "失败 " + errCol));
+            Console.WriteLine("预写工作表顺序: " + (orderOk ? "OK" : "失败 " + errOrder));
+
+            bool renameOk = wb.TryRenameSheet(oldName, newName, out var errR);
+            Console.WriteLine("重命名: " + (renameOk ? "OK" : "失败 " + errR));
+            if (!renameOk) return 3;
+            bool namesOk = !wb.SheetNames.Contains(oldName, StringComparer.OrdinalIgnoreCase)
+                && wb.SheetNames.Contains(newName, StringComparer.OrdinalIgnoreCase);
+            var colAfter = wb.GetColumnOrder(newName);
+            bool colMigrated = colAfter != null && colAfter.SequenceEqual(colOrder);
+            var sheetOrderAfter = wb.GetSheetDisplayOrder();
+            bool orderMigrated = sheetOrderAfter != null
+                && sheetOrderAfter.Contains(newName, StringComparer.OrdinalIgnoreCase)
+                && !sheetOrderAfter.Contains(oldName, StringComparer.OrdinalIgnoreCase);
+            Console.WriteLine("列表已更新: " + (namesOk ? "OK" : "失败"));
+            Console.WriteLine("列顺序键迁移: " + (colMigrated ? "OK" : "失败"));
+            Console.WriteLine("工作表顺序迁移: " + (orderMigrated ? "OK" : "失败"));
+            wb.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            bool persistent = wb2.SheetNames.Contains(newName, StringComparer.OrdinalIgnoreCase)
+                && !wb2.SheetNames.Contains(oldName, StringComparer.OrdinalIgnoreCase);
+            Console.WriteLine("关闭后重读: " + (persistent ? "OK" : "失败"));
+
+            // 重名与非法字符校验
+            var dupOk = wb2.TryRenameSheet(newName, wb2.SheetNames.First(n => !string.Equals(n, newName, StringComparison.OrdinalIgnoreCase)), out var errDup);
+            Console.WriteLine("重名校验: " + (!dupOk && errDup != null ? "OK" : "失败"));
+            var badOk = wb2.TryRenameSheet(newName, "bad/name", out var errBad);
+            Console.WriteLine("非法字符校验: " + (!badOk && errBad != null ? "OK" : "失败"));
+            allOk &= namesOk && colMigrated && orderMigrated && persistent && !dupOk && !badOk;
 
             using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
             bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));

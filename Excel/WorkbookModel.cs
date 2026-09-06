@@ -25,8 +25,12 @@ public sealed class WorkbookModel : IDisposable
 
     /// <summary>用于持久化各工作表列显示顺序的非常隐藏内部配置表名。</summary>
     private const string OrderSheetName = "__GameCurve__";
+    /// <summary>内部配置表中记录“工作表显示顺序”的哨兵键。</summary>
+    private const string SheetOrderKey = "!SHEETS";
     /// <summary>打开时从配置表读入的列顺序（按工作表名缓存）。</summary>
     private readonly Dictionary<string, int[]> _columnOrders = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>打开时从配置表读入的工作表显示顺序（工作表名序列）。</summary>
+    private List<string>? _sheetOrder;
 
     public IReadOnlyList<string> SheetNames { get; private set; } = Array.Empty<string>();
 
@@ -37,13 +41,17 @@ public sealed class WorkbookModel : IDisposable
         using var doc = SpreadsheetDocument.Open(path, false);
         var wbPart = doc.WorkbookPart!;
         var wb = wbPart.Workbook;
-        // 内部配置表“__GameCurve__”不出现在用户可见的工作表列表中
-        SheetNames = (wb.Sheets?.Elements<Sheet>()
-            .Where(s => !string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase))
-            .Select(s => s.Name!.Value!).ToList() ?? new List<string>());
+        SheetNames = ReadSheetNames(wbPart);
         LoadColumnOrders(wbPart);
         LastModified = File.GetLastWriteTimeUtc(path);
     }
+
+    /// <summary>枚举用户可见的工作表（排除内部配置表），保持物理顺序。</summary>
+    private static IReadOnlyList<string> ReadSheetNames(WorkbookPart wbPart)
+        => wbPart.Workbook.Sheets?.Elements<Sheet>()
+            .Where(s => !string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase))
+            .Select(s => s.Name!.Value!)
+            .ToList() ?? new List<string>();
 
     /// <summary>重新读取文件元信息（用于外部变更后重载）。</summary>
     public void RefreshMeta()
@@ -56,6 +64,7 @@ public sealed class WorkbookModel : IDisposable
     private void LoadColumnOrders(WorkbookPart wbPart)
     {
         _columnOrders.Clear();
+        _sheetOrder = null;
         var sheet = wbPart.Workbook.Sheets?.Elements<Sheet>()
             .FirstOrDefault(s => string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase));
         if (sheet == null) return;
@@ -70,6 +79,13 @@ public sealed class WorkbookModel : IDisposable
             var name = CellHelper.GetCellValue(cells[0]);
             var text = CellHelper.GetCellValue(cells[1]);
             if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(text)) continue;
+            // 工作表显示顺序的哨兵行：值是一串逗号分隔的工作表名
+            if (string.Equals(name, SheetOrderKey, StringComparison.Ordinal))
+            {
+                var so = ParseSheetOrder(text);
+                if (so != null) _sheetOrder = so;
+                continue;
+            }
             var order = ParseColumnOrder(text);
             if (order != null && order.Length > 0) _columnOrders[name] = order;
         }
@@ -84,9 +100,26 @@ public sealed class WorkbookModel : IDisposable
         return list.Count > 0 ? list.Distinct().ToArray() : null;
     }
 
+    private static List<string>? ParseSheetOrder(string text)
+    {
+        var parts = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0) return null;
+        var list = new List<string>();
+        foreach (var p in parts)
+            if (!string.IsNullOrWhiteSpace(p)) list.Add(p);
+        var distinct = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in list)
+            if (seen.Add(p)) distinct.Add(p);
+        return distinct.Count > 0 ? distinct : null;
+    }
+
     /// <summary>返回某工作表的列显示顺序（物理列索引数组）；未记录时返回 null。</summary>
     public IReadOnlyList<int>? GetColumnOrder(string sheetName)
         => _columnOrders.TryGetValue(sheetName, out var o) ? o : null;
+
+    /// <summary>返回保存的工作表显示顺序；未记录时返回 null。</summary>
+    public IReadOnlyList<string>? GetSheetDisplayOrder() => _sheetOrder?.ToList();
 
     /// <summary>把某工作表的列显示顺序写入内部配置表（非常隐藏），随文件持久化。</summary>
     public bool TryWriteColumnOrder(string sheetName, IReadOnlyList<int> order, out string? error)
@@ -98,26 +131,7 @@ public sealed class WorkbookModel : IDisposable
             _columnOrders[sheetName] = order.Distinct().ToArray();
             using var doc = SpreadsheetDocument.Open(Path, true);
             var wbPart = doc.WorkbookPart!;
-            var wsPart = GetOrCreateOrderSheet(wbPart);
-            var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
-            if (sheetData == null)
-            {
-                sheetData = new SheetData();
-                wsPart.Worksheet.AppendChild(sheetData);
-            }
-            // 每次全量重写，确保多个工作表的顺序都被保留且不重复
-            sheetData.RemoveAllChildren();
-            int rowNum = 1;
-            foreach (var kv in _columnOrders)
-            {
-                var row = new Row { RowIndex = (uint)rowNum };
-                row.Append(
-                    MakeInlineCell("A" + rowNum, kv.Key),
-                    MakeInlineCell("B" + rowNum, string.Join(",", kv.Value)));
-                sheetData.AppendChild(row);
-                rowNum++;
-            }
-            wsPart.Worksheet.Save();
+            WriteOrderSheet(wbPart);
             doc.Save();
             LastModified = File.GetLastWriteTimeUtc(Path);
             return true;
@@ -130,6 +144,198 @@ public sealed class WorkbookModel : IDisposable
         catch (Exception ex)
         {
             error = "保存列顺序失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>把某工作簿的工作表显示顺序写入内部配置表（非常隐藏），随文件持久化。</summary>
+    public bool TryWriteSheetOrder(IReadOnlyList<string> order, out string? error)
+    {
+        error = null;
+        if (order == null || order.Count == 0) return true;
+        try
+        {
+            _sheetOrder = order.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            WriteOrderSheet(wbPart);
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存工作表顺序。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存工作表顺序失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>全量重写内部配置表：所有工作表列顺序 + 工作表显示顺序，保证两者互不覆盖。</summary>
+    private void WriteOrderSheet(WorkbookPart wbPart)
+    {
+        var wsPart = GetOrCreateOrderSheet(wbPart);
+        var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
+        if (sheetData == null)
+        {
+            sheetData = new SheetData();
+            wsPart.Worksheet.AppendChild(sheetData);
+        }
+        // 每次全量重写，确保多个工作表的列顺序都保留且不重复
+        sheetData.RemoveAllChildren();
+        int rowNum = 1;
+        foreach (var kv in _columnOrders)
+        {
+            var row = new Row { RowIndex = (uint)rowNum };
+            row.Append(
+                MakeInlineCell("A" + rowNum, kv.Key),
+                MakeInlineCell("B" + rowNum, string.Join(",", kv.Value)));
+            sheetData.AppendChild(row);
+            rowNum++;
+        }
+        if (_sheetOrder != null && _sheetOrder.Count > 0)
+        {
+            var row = new Row { RowIndex = (uint)rowNum };
+            row.Append(
+                MakeInlineCell("A" + rowNum, SheetOrderKey),
+                MakeInlineCell("B" + rowNum, string.Join(",", _sheetOrder)));
+            sheetData.AppendChild(row);
+        }
+        wsPart.Worksheet.Save();
+    }
+
+    /// <summary>
+    /// 新建一张空白工作表（含一列表头与一行空白数据，方便直接开始编辑），
+    /// 追加到工作簿末尾并刷新 SheetNames。
+    /// </summary>
+    public bool TryAddSheet(string sheetName, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(sheetName))
+        {
+            error = "工作表名不能为空。";
+            return false;
+        }
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            bool exists = wbPart.Workbook.Sheets?.Elements<Sheet>()
+                .Any(s => string.Equals(s.Name?.Value, sheetName, StringComparison.OrdinalIgnoreCase)) ?? false;
+            if (exists)
+            {
+                error = "已存在同名工作表：" + sheetName;
+                return false;
+            }
+
+            var wsPart = wbPart.AddNewPart<WorksheetPart>();
+            wsPart.Worksheet = new Worksheet(new SheetData());
+            var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>()!;
+            var headerRow = new Row { RowIndex = 1 };
+            headerRow.Append(MakeInlineCell("A1", "新列A"));
+            var dataRow = new Row { RowIndex = 2 };
+            dataRow.Append(MakeInlineCell("A2", ""));
+            sheetData.Append(headerRow, dataRow);
+            wsPart.Worksheet.Save();
+
+            var sheets = wbPart.Workbook.GetFirstChild<Sheets>();
+            uint sheetId = 1;
+            if (sheets != null && sheets.Elements<Sheet>().Any())
+                sheetId = (uint)(sheets.Elements<Sheet>().Max(s => s.SheetId?.Value ?? 0) + 1);
+            sheets ??= wbPart.Workbook.AppendChild(new Sheets());
+            sheets.AppendChild(new Sheet
+            {
+                Name = sheetName,
+                SheetId = sheetId,
+                Id = wbPart.GetIdOfPart(wsPart)
+            });
+
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            SheetNames = ReadSheetNames(wbPart);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法新建工作表。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "新建工作表失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>把工作表重命名为 newName，并同步内部顺序配置表（列顺序键、工作表顺序）。</summary>
+    public bool TryRenameSheet(string oldName, string newName, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(newName))
+        {
+            error = "工作表名不能为空。";
+            return false;
+        }
+        if (newName.Length > 31)
+        {
+            error = "工作表名长度不能超过 31 个字符。";
+            return false;
+        }
+        if (newName.IndexOfAny(new[] { '\\', '/', '?', '*', '[', ']', ':' }) >= 0)
+        {
+            error = "工作表名不能包含字符 \\ / ? * [ ] : 。";
+            return false;
+        }
+        if (string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
+            return true; // 无变化
+
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            var sheets = wbPart.Workbook.Sheets;
+            var sheet = sheets?.Elements<Sheet>()
+                .FirstOrDefault(s => string.Equals(s.Name?.Value, oldName, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException("找不到工作表 " + oldName);
+            bool dup = sheets!.Elements<Sheet>().Any(s =>
+                s != sheet && string.Equals(s.Name?.Value, newName, StringComparison.OrdinalIgnoreCase));
+            if (dup)
+            {
+                error = "已存在同名工作表：" + newName;
+                return false;
+            }
+
+            sheet.Name = newName;
+            // 同步内存中的列顺序键与工作表显示顺序
+            if (_columnOrders.TryGetValue(oldName, out var order))
+            {
+                _columnOrders.Remove(oldName);
+                _columnOrders[newName] = order;
+            }
+            if (_sheetOrder != null)
+            {
+                int idx = _sheetOrder.FindIndex(n => string.Equals(n, oldName, StringComparison.OrdinalIgnoreCase));
+                if (idx >= 0) _sheetOrder[idx] = newName;
+            }
+            if (_columnOrders.Count > 0 || (_sheetOrder != null && _sheetOrder.Count > 0))
+                WriteOrderSheet(wbPart);
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            SheetNames = ReadSheetNames(wbPart);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法重命名工作表。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "重命名工作表失败：" + ex.Message;
             return false;
         }
     }

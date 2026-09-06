@@ -26,6 +26,7 @@ public sealed class MainForm : Form
     private bool _suppressColumnOrderDirty;
     private bool _columnWidthDirty;
     private bool _suppressColumnWidthDirty;
+    private bool _sheetOrderDirty;
     private TextBox? _headerEdit;
     private int _headerEditPhysicalCol = -1;   // -1 表示没有在编辑列名
 
@@ -54,6 +55,13 @@ public sealed class MainForm : Form
         BackColor = Color.FromArgb(226, 230, 236)
     };
     private readonly List<Button> _sheetButtons = new();
+    private Button? _addSheetButton;
+    private Button? _dragSheetBtn;
+    private Point _dragSheetStart;
+    private bool _draggingSheet;
+    private bool _suppressSheetClick;
+    private TextBox? _sheetRenameEdit;
+    private string _sheetRenameOldName = "";
 
     // 左：列选择面板
     private readonly CheckedListBox _colsChecked = new() { CheckOnClick = true, BorderStyle = BorderStyle.FixedSingle };
@@ -133,7 +141,8 @@ public sealed class MainForm : Form
         (string Sheet, ColumnMeta Col)? Best,
         string TargetSheet,
         SheetLoadData TargetLoad,
-        string? Error);
+        string? Error,
+        bool ShowOccupiedHint = false);
 
     private readonly System.Windows.Forms.Timer _autoSaveTimer = new() { Interval = 600 };
     private readonly System.Windows.Forms.Timer _reloadTimer = new() { Interval = 600 };
@@ -529,7 +538,9 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            return new OpenPrepared(null!, null, "", new SheetLoadData { Error = ex.Message }, ex.Message);
+            // 文件被占用（如 Excel 已打开）时 OpenXml 通常会抛 IOException
+            bool occupied = ex is IOException or UnauthorizedAccessException;
+            return new OpenPrepared(null!, null, "", new SheetLoadData { Error = ex.Message }, ex.Message, occupied);
         }
     }
 
@@ -538,8 +549,13 @@ public sealed class MainForm : Form
         _busyLoading = false;
         if (prep.Error != null)
         {
-            MessageBox.Show(this, "无法打开文件：\n" + prep.Error, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
             CloseSplash();
+            string hint = prep.ShowOccupiedHint
+                ? "\n\n该文件当前可能被其他程序（如 Excel）占用，请关闭后重试。"
+                : "";
+            MessageBox.Show(this, "无法打开文件：\n" + prep.Error + hint, "错误",
+                MessageBoxButtons.OK, MessageBoxIcon.Error,
+                MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
             return;
         }
         _wb?.Dispose();
@@ -564,7 +580,15 @@ public sealed class MainForm : Form
         {
             var r = MessageBox.Show(this, "有未保存的改动，是否保存？", "确认", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
             if (r == DialogResult.Cancel) return;
-            if (r == DialogResult.Yes) CommitPending();
+            if (r == DialogResult.Yes)
+            {
+                if (!CommitPending(out var err))
+                {
+                    MessageBox.Show(this, string.IsNullOrEmpty(err) ? "保存失败，请检查文件是否被占用。" : err,
+                        "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
         }
         _watcher?.Dispose();
         _watcher = null;
@@ -598,6 +622,8 @@ public sealed class MainForm : Form
         _pendingColumnAlign.Clear();
         _structureQueued = false;
         _columnOrderDirty = false;
+        _columnWidthDirty = false;
+        _sheetOrderDirty = false;
         _grid.Columns.Clear();
         _grid.Rows.Clear();
         _colsChecked.Items.Clear();
@@ -608,6 +634,7 @@ public sealed class MainForm : Form
         _sheetStrip.SuspendLayout();
         _sheetStrip.Controls.Clear();
         _sheetButtons.Clear();
+        _addSheetButton = null;
         _sheetStrip.ResumeLayout();
         _statusLabel.Text = "已关闭当前文件";
         RebuildOpenMenu();
@@ -674,6 +701,8 @@ public sealed class MainForm : Form
         }
         _snapshot = d.Snapshot;
         _columnOrderDirty = false;
+        _columnWidthDirty = false;
+        _sheetOrderDirty = false;
         var curveOptions = d.CurveOptions;
         _autoFocusCol = -1;
         _colsChecked.Items.Clear();
@@ -750,13 +779,17 @@ public sealed class MainForm : Form
 
     private void BuildSheetStrip()
     {
+        CancelSheetRename();
+        var prevOrder = _sheetButtons.Count > 0
+            ? _sheetButtons.Select(b => (string)b.Tag!).ToList()
+            : null;
         _sheetStrip.SuspendLayout();
         _sheetStrip.Controls.Clear();
         _sheetButtons.Clear();
+        _addSheetButton = null;
         if (_wb == null) { _sheetStrip.ResumeLayout(); return; }
-        foreach (var name in _wb.SheetNames)
+        foreach (var name in GetDisplayOrderedSheetNames(prevOrder))
         {
-            if (ShouldHideSheet(name)) continue;
             var b = new Button
             {
                 Text = name,
@@ -770,12 +803,306 @@ public sealed class MainForm : Form
                 ForeColor = Color.FromArgb(50, 56, 64)
             };
             b.FlatAppearance.BorderSize = 0;
-            b.Click += (s, e) => ActivateSheet(((Button)s!).Tag!.ToString()!);
+            b.Click += (s, e) =>
+            {
+                if (_suppressSheetClick) { _suppressSheetClick = false; return; }
+                ActivateSheet(((Button)s!).Tag!.ToString()!);
+            };
+            b.MouseDown += OnSheetMouseDown;
+            b.MouseMove += OnSheetMouseMove;
+            b.MouseUp += OnSheetMouseUp;
             _sheetStrip.Controls.Add(b);
             _sheetButtons.Add(b);
         }
+        var addBtn = new Button
+        {
+            Text = "+",
+            Tag = "__add__",
+            Size = new Size(32, 26),
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(3, 2, 1, 2),
+            Cursor = Cursors.Hand,
+            BackColor = Color.FromArgb(226, 230, 236),
+            ForeColor = Color.FromArgb(50, 56, 64),
+            Font = new Font("Microsoft YaHei UI", 12f, FontStyle.Regular)
+        };
+        addBtn.FlatAppearance.BorderSize = 0;
+        addBtn.Click += (s, e) => OnAddSheet();
+        _addSheetButton = addBtn;
+        _sheetStrip.Controls.Add(addBtn);
+        _tip.SetToolTip(addBtn, "新建工作表");
         _sheetStrip.ResumeLayout();
         HighlightActiveSheet();
+    }
+
+    /// <summary>按保存的工作表显示顺序返回用户可见工作表名列表（未记录的排在末尾）。</summary>
+    private List<string> GetDisplayOrderedSheetNames(IReadOnlyList<string>? priorityOrder = null)
+    {
+        var visible = _wb!.SheetNames.Where(s => !ShouldHideSheet(s)).ToList();
+        // 优先使用当前标签栏既有的显示顺序（含未保存的拖拽），否则用保存的顺序
+        var baseOrder = priorityOrder != null && priorityOrder.Count > 0
+            ? priorityOrder
+            : _wb.GetSheetDisplayOrder();
+        if (baseOrder == null || baseOrder.Count == 0) return visible;
+        var result = new List<string>();
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in baseOrder)
+            if (visible.Contains(name, StringComparer.OrdinalIgnoreCase) && used.Add(name))
+                result.Add(name);
+        foreach (var name in visible)
+            if (used.Add(name)) result.Add(name);
+        return result;
+    }
+
+    /// <summary>把当前 <see cref="_sheetStrip"/> 中除“+”外的按钮顺序同步到 <see cref="_sheetButtons"/>。</summary>
+    private void SyncSheetButtons()
+    {
+        _sheetButtons.Clear();
+        foreach (var c in _sheetStrip.Controls.Cast<Control>())
+            if (c is Button b && b != _addSheetButton && !Equals(b.Tag, "__add__"))
+                _sheetButtons.Add(b);
+    }
+
+    /// <summary>把“+”按钮固定在标签栏最右侧。</summary>
+    private void EnsureAddSheetLast()
+    {
+        if (_addSheetButton == null) return;
+        int addIndex = _sheetStrip.Controls.IndexOf(_addSheetButton);
+        int lastIndex = _sheetStrip.Controls.Count - 1;
+        if (addIndex != lastIndex)
+            _sheetStrip.Controls.SetChildIndex(_addSheetButton, lastIndex);
+    }
+
+    /// <summary>sheet 标签按住拖拽：记录起点。</summary>
+    private void OnSheetMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        // 双击进入改名（MouseDown 的 Clicks==2 比 DoubleClick 事件更可靠）
+        if (e.Clicks == 2)
+        {
+            BeginSheetRename((Button)sender!);
+            return;
+        }
+        _dragSheetBtn = (Button)sender!;
+        _dragSheetStart = e.Location;
+        _draggingSheet = false;
+        _suppressSheetClick = false;
+        _dragSheetBtn.Capture = true;
+    }
+
+    /// <summary>sheet 标签拖拽过程中：移动到其它标签位置时交换顺序。</summary>
+    private void OnSheetMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (_dragSheetBtn == null || sender != _dragSheetBtn) return;
+        if (!_draggingSheet)
+        {
+            if (Math.Abs(e.X - _dragSheetStart.X) < SystemInformation.DragSize.Width &&
+                Math.Abs(e.Y - _dragSheetStart.Y) < SystemInformation.DragSize.Height)
+                return;
+            _draggingSheet = true;
+        }
+        var pos = _sheetStrip.PointToClient(Cursor.Position);
+        if (_sheetStrip.GetChildAtPoint(pos) is not Button target) return;
+        if (target == _dragSheetBtn || target == _addSheetButton) return;
+        int from = _sheetStrip.Controls.IndexOf(_dragSheetBtn);
+        int to = _sheetStrip.Controls.IndexOf(target);
+        if (from == to) return;
+        _sheetStrip.Controls.SetChildIndex(_dragSheetBtn, to);
+        EnsureAddSheetLast();
+        SyncSheetButtons();
+        _sheetStrip.PerformLayout();
+    }
+
+    /// <summary>sheet 标签拖拽结束：标记工作表顺序为待保存。</summary>
+    private void OnSheetMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (_dragSheetBtn == null) return;
+        _dragSheetBtn.Capture = false;
+        bool changed = _draggingSheet;
+        _dragSheetBtn = null;
+        _draggingSheet = false;
+        if (changed)
+        {
+            _suppressSheetClick = true;
+            _sheetOrderDirty = true;
+            HighlightActiveSheet();
+            PersistSheetOrder();
+            UpdateTitle();
+        }
+    }
+
+    /// <summary>把当前标签栏顺序写入文件；成功则清除脏标记，失败保留以便下次保存重试。</summary>
+    private void PersistSheetOrder()
+    {
+        if (_wb == null) return;
+        var order = GetDisplayedSheetOrder();
+        if (order.Count == 0) return;
+        var saved = _wb.GetSheetDisplayOrder();
+        if (saved != null && saved.SequenceEqual(order))
+        {
+            _sheetOrderDirty = false;
+            return;
+        }
+        _selfWrite = true;
+        bool ok = _wb.TryWriteSheetOrder(order, out var err);
+        _selfWrite = false;
+        if (ok) _sheetOrderDirty = false;
+        else _statusLabel.Text = "⚠ 保存工作表顺序失败：" + (err ?? "");
+    }
+
+    /// <summary>返回当前标签栏显示的工作表顺序（名称序列）。</summary>
+    private List<string> GetDisplayedSheetOrder()
+        => _sheetButtons.Select(b => (string)b.Tag!).ToList();
+
+    /// <summary>点击“+”新建一张工作表并切换到它。</summary>
+    private void OnAddSheet()
+    {
+        if (_wb == null) return;
+        string name = MakeUniqueSheetName();
+        _selfWrite = true;
+        bool ok = _wb.TryAddSheet(name, out var err);
+        _selfWrite = false;
+        if (!ok)
+        {
+            _statusLabel.Text = "⚠ " + (err ?? "新建工作表失败");
+            MessageBox.Show(this, err ?? "新建工作表失败", "新建工作表失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        _statusLabel.Text = "已新建工作表 " + name;
+        _autoFocusSheet = name;
+        _autoFocusCol = 1;
+        BuildSheetStrip();
+        ActivateSheet(name);
+    }
+
+    /// <summary>生成一个不与现有工作表重名的名称（新表1、新表2…）。</summary>
+    private string MakeUniqueSheetName()
+    {
+        var existing = new HashSet<string>(_wb!.SheetNames, StringComparer.OrdinalIgnoreCase);
+        int n = 1;
+        while (existing.Contains("新表" + n)) n++;
+        return "新表" + n;
+    }
+
+    /// <summary>双击 sheet 标签：在按钮原位弹出内联编辑框修改工作表名。</summary>
+    private void BeginSheetRename(Button btn)
+    {
+        if (_wb == null || btn.Tag is not string name) return;
+        CommitHeaderEdit(); // 先结束可能存在的列名编辑
+        // 双击进入改名，结束拖拽状态并抑制随后的第二次 Click 触发工作表切换
+        if (_dragSheetBtn != null)
+        {
+            _dragSheetBtn.Capture = false;
+            _dragSheetBtn = null;
+            _draggingSheet = false;
+        }
+        _suppressSheetClick = true;
+        var tb = new TextBox
+        {
+            Text = name,
+            TextAlign = HorizontalAlignment.Center,
+            Font = btn.Font,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Color.White,
+            Multiline = false,
+            TabStop = false,
+            Bounds = btn.Bounds
+        };
+        tb.KeyDown += OnSheetRenameKeyDown;
+        tb.Leave += OnSheetRenameLeave;
+        // 放在父容器上叠盖（FlowLayoutPanel 会把子控件当作流式项，不适合叠加）
+        if (_gridPane == null)
+        {
+            tb.Dispose();
+            return;
+        }
+        Point pos = _gridPane.PointToClient(_sheetStrip.PointToScreen(btn.Location));
+        tb.Bounds = new Rectangle(pos, btn.Size);
+        _gridPane.Controls.Add(tb);
+        tb.BringToFront();
+        tb.Focus();
+        tb.SelectAll();
+        _sheetRenameEdit = tb;
+        _sheetRenameOldName = name;
+    }
+
+    private void OnSheetRenameKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Enter) { CommitSheetRename(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.Escape) { CancelSheetRename(); e.Handled = true; e.SuppressKeyPress = true; }
+    }
+
+    private void OnSheetRenameLeave(object? sender, EventArgs e) => CommitSheetRename();
+
+    /// <summary>提交 sheet 改名并写回文件。</summary>
+    private void CommitSheetRename()
+    {
+        var tb = _sheetRenameEdit;
+        if (tb == null) return;
+        _sheetRenameEdit = null;
+        string newName = tb.Text.Trim();
+        string oldName = _sheetRenameOldName;
+        _sheetRenameOldName = "";
+        tb.Dispose();
+
+        if (_wb == null || string.IsNullOrWhiteSpace(oldName)) return;
+        if (string.IsNullOrWhiteSpace(newName))
+        {
+            _statusLabel.Text = "⚠ 工作表名不能为空";
+            return;
+        }
+        if (string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase)) return;
+
+        // 正在改活动表且存在未保存改动：先保存/丢弃，避免后续结构改动引用旧名
+        if (string.Equals(oldName, _activeSheet, StringComparison.OrdinalIgnoreCase) && HasUnsavedChanges())
+        {
+            var r = MessageBox.Show(this, "重命名前是否保存当前改动？", "确认",
+                MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel) return;
+            if (r == DialogResult.Yes) CommitPending();
+            else DiscardUnsaved();
+        }
+
+        _selfWrite = true;
+        bool ok = _wb.TryRenameSheet(oldName, newName, out var err);
+        _selfWrite = false;
+        if (!ok)
+        {
+            _statusLabel.Text = "⚠ " + (err ?? "重命名失败");
+            MessageBox.Show(this, err ?? "重命名失败", "重命名工作表失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        bool wasActive = string.Equals(oldName, _activeSheet, StringComparison.OrdinalIgnoreCase);
+        if (wasActive)
+        {
+            _activeSheet = newName;
+            if (_snapshot != null && string.Equals(_snapshot.SheetName, oldName, StringComparison.OrdinalIgnoreCase))
+                _snapshot.SheetName = newName;
+            if (string.Equals(_autoFocusSheet, oldName, StringComparison.OrdinalIgnoreCase))
+                _autoFocusSheet = newName;
+        }
+        // 原地更新标签文字与 Tag，避免整条重建在用户点击其它标签时吞掉那次点击
+        foreach (var b in _sheetButtons)
+            if (string.Equals((string)b.Tag!, oldName, StringComparison.OrdinalIgnoreCase))
+            {
+                b.Text = newName;
+                b.Tag = newName;
+                break;
+            }
+        HighlightActiveSheet();
+        _statusLabel.Text = "已重命名工作表 " + oldName + " → " + newName;
+        UpdateTitle();
+    }
+
+    /// <summary>取消 sheet 改名，直接关闭内联编辑框。</summary>
+    private void CancelSheetRename()
+    {
+        var tb = _sheetRenameEdit;
+        if (tb == null) return;
+        _sheetRenameEdit = null;
+        _sheetRenameOldName = "";
+        tb.Dispose();
     }
 
     private void HighlightActiveSheet()
@@ -806,7 +1133,7 @@ public sealed class MainForm : Form
         StartSheetLoad(name);
     }
 
-    private bool HasUnsavedChanges() => _dirtyCells.Count > 0 || _structureQueued || _pendingHeaderRename.Count > 0 || _pendingHeaderAlign.Count > 0 || _pendingColumnAlign.Count > 0 || _columnOrderDirty;
+    private bool HasUnsavedChanges() => _dirtyCells.Count > 0 || _structureQueued || _pendingHeaderRename.Count > 0 || _pendingHeaderAlign.Count > 0 || _pendingColumnAlign.Count > 0 || _columnOrderDirty || _columnWidthDirty || _sheetOrderDirty;
 
     private void DiscardUnsaved()
     {
@@ -818,6 +1145,8 @@ public sealed class MainForm : Form
         _pendingColumnAlign.Clear();
         _structureQueued = false;
         _columnOrderDirty = false;
+        _columnWidthDirty = false;
+        _sheetOrderDirty = false;
         ApplySavedColumnOrder();
         _pendingUndoRows.Clear();
         _subEditOldText.Clear();
@@ -1068,11 +1397,16 @@ public sealed class MainForm : Form
         return false;
     }
 
-    private void CommitPending()
+    /// <summary>把当前未保存的改动写回工作簿。返回是否成功。</summary>
+    private bool CommitPending() => CommitPending(out _);
+
+    /// <summary>把当前未保存的改动写回工作簿。返回是否成功；失败时把原因写入 <paramref name="error"/>。</summary>
+    private bool CommitPending(out string? error)
     {
-        if (_wb == null) return;
+        error = null;
+        if (_wb == null) return true;
         bool hasStructure = _pendingStructure.Count > 0;
-        if (_dirtyCells.Count == 0 && !hasStructure && _pendingHeaderRename.Count == 0 && _pendingHeaderAlign.Count == 0 && _pendingColumnAlign.Count == 0 && !_columnOrderDirty) return;
+        if (_dirtyCells.Count == 0 && !hasStructure && _pendingHeaderRename.Count == 0 && _pendingHeaderAlign.Count == 0 && _pendingColumnAlign.Count == 0 && !_columnOrderDirty && !_columnWidthDirty && !_sheetOrderDirty) return true;
         _autoSaveTimer.Stop();
         var sheet = _snapshot?.SheetName ?? _activeSheet;
 
@@ -1085,8 +1419,9 @@ public sealed class MainForm : Form
             if (!okStructure)
             {
                 _statusLabel.Text = "⚠ " + errStructure;
+                error = errStructure;
                 UpdateTitle();
-                return;
+                return false;
             }
             _pendingStructure.Clear();
             _structureQueued = false;
@@ -1162,22 +1497,95 @@ public sealed class MainForm : Form
             if (okOrder) _columnOrderDirty = false;
         }
 
-        if (!ok) _statusLabel.Text = "⚠ " + errNum;
-        else if (!okStr) _statusLabel.Text = "⚠ " + errStr;
-        else if (!okHeader) _statusLabel.Text = "⚠ " + errHeader;
-        else if (!okColAlign) _statusLabel.Text = "⚠ " + errColAlign;
-        else if (!okOrder) _statusLabel.Text = "⚠ " + errOrder;
+        // 7) 列宽写回（用户调整列宽后，按当前显示宽度写回 Excel 工作表的 <cols>）
+        bool okWidth = true;
+        string? errWidth = null;
+        bool widthChanged = _columnWidthDirty;
+        if (widthChanged && _snapshot != null)
+        {
+            var widths = BuildCurrentColumnWidths();
+            _selfWrite = true;
+            okWidth = _wb.TryWriteColumnWidths(_snapshot.SheetName, widths, out errWidth);
+            _selfWrite = false;
+            if (okWidth) _columnWidthDirty = false;
+        }
+
+        // 8) 工作表显示顺序写回（用户拖拽 sheet 标签后的顺序，随文件持久化）
+        bool okSheetOrder = true;
+        string? errSheetOrder = null;
+        bool sheetOrderChanged = _sheetOrderDirty;
+        if (sheetOrderChanged && _wb != null)
+        {
+            var sheetOrder = GetDisplayedSheetOrder();
+            _selfWrite = true;
+            okSheetOrder = _wb.TryWriteSheetOrder(sheetOrder, out errSheetOrder);
+            _selfWrite = false;
+            if (okSheetOrder) _sheetOrderDirty = false;
+        }
+
+        if (!ok)
+        {
+            _statusLabel.Text = "⚠ " + errNum;
+            error = errNum;
+            UpdateTitle();
+            return false;
+        }
+        if (!okStr)
+        {
+            _statusLabel.Text = "⚠ " + errStr;
+            error = errStr;
+            UpdateTitle();
+            return false;
+        }
+        if (!okHeader)
+        {
+            _statusLabel.Text = "⚠ " + errHeader;
+            error = errHeader;
+            UpdateTitle();
+            return false;
+        }
+        if (!okColAlign)
+        {
+            _statusLabel.Text = "⚠ " + errColAlign;
+            error = errColAlign;
+            UpdateTitle();
+            return false;
+        }
+        if (!okOrder)
+        {
+            _statusLabel.Text = "⚠ " + errOrder;
+            error = errOrder;
+            UpdateTitle();
+            return false;
+        }
+        if (!okWidth)
+        {
+            _statusLabel.Text = "⚠ " + errWidth;
+            error = errWidth;
+            UpdateTitle();
+            return false;
+        }
+        if (!okSheetOrder)
+        {
+            _statusLabel.Text = "⚠ " + errSheetOrder;
+            error = errSheetOrder;
+            UpdateTitle();
+            return false;
+        }
         else
         {
             int cellCount = nums.Count + strs.Count;
-            _statusLabel.Text = orderChanged
-                ? (cellCount > 0 ? $"已保存 {cellCount} 个单元格并保存列顺序" : "已保存列顺序")
+            bool metaSaved = orderChanged || widthChanged || sheetOrderChanged;
+            _statusLabel.Text = metaSaved
+                ? (cellCount > 0 ? $"已保存 {cellCount} 个单元格并保存布局信息" : "已保存布局信息")
                 : $"已保存 {cellCount} 个单元格";
             _structureQueued = false;
             _pendingHeaderRename.Clear();
             _dirtyCells.Clear();
         }
+        error = null;
         UpdateTitle();
+        return true;
     }
 
     /// <summary>按当前 DataGridView 的显示顺序返回物理列索引序列（用于持久化）。</summary>
@@ -1224,6 +1632,34 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>用户调整列宽时同步到快照并标记为待保存（程序化设置列宽时被抑制）。</summary>
+    private void OnGridColumnWidthChanged(object? sender, DataGridViewColumnEventArgs e)
+    {
+        if (_suppressColumnWidthDirty || _snapshot == null) return;
+        var col = e.Column;
+        if (col == null || col.Name == "行号") return;
+        int physical = col.Index - 1;
+        if (physical < 0 || physical >= _snapshot.Columns.Count) return;
+        _snapshot.Columns[physical].Width = CellHelper.PixelsToCharacterWidth(col.Width);
+        _columnWidthDirty = true;
+    }
+
+    /// <summary>按当前 DataGridView 的列宽构建写回清单（物理列索引 0 基，宽度为字符串位）。</summary>
+    private List<(int Col, double Width)> BuildCurrentColumnWidths()
+    {
+        var result = new List<(int, double)>();
+        if (_snapshot == null) return result;
+        for (int physical = 0; physical < _snapshot.Columns.Count; physical++)
+        {
+            int gridIndex = physical + 1;
+            if (gridIndex < 0 || gridIndex >= _grid.Columns.Count) continue;
+            var col = _grid.Columns[gridIndex];
+            if (col.Name == "行号") continue;
+            result.Add((physical, CellHelper.PixelsToCharacterWidth(col.Width)));
+        }
+        return result;
+    }
+
     private string CellText(int col, int row)
     {
         if (_snapshot != null && _rowToGridIndex.TryGetValue(row, out var gi) &&
@@ -1259,8 +1695,15 @@ public sealed class MainForm : Form
     {
         CancelHeaderEdit();
         _suppressColumnOrderDirty = true;
+        _suppressColumnWidthDirty = true;
         _grid.Columns.Clear();
-        if (_snapshot == null) { _grid.Rows.Clear(); _suppressColumnOrderDirty = false; return; }
+        if (_snapshot == null)
+        {
+            _grid.Rows.Clear();
+            _suppressColumnOrderDirty = false;
+            _suppressColumnWidthDirty = false;
+            return;
+        }
         var header = new DataGridViewTextBoxColumn
         {
             HeaderText = "行号",
@@ -1274,6 +1717,9 @@ public sealed class MainForm : Form
         _grid.Columns.Add(header);
         foreach (var col in _snapshot.Columns)
         {
+            int colWidth = col.Width.HasValue
+                ? CellHelper.CharacterWidthToPixels(col.Width.Value)
+                : 130;
             var c = new DataGridViewTextBoxColumn
             {
                 HeaderText = col.DisplayName,
@@ -1281,7 +1727,7 @@ public sealed class MainForm : Form
                 ReadOnly = false,
                 Resizable = DataGridViewTriState.True,
                 MinimumWidth = 60,
-                Width = 130,
+                Width = colWidth,
                 SortMode = DataGridViewColumnSortMode.NotSortable
             };
             int ci = col.ColumnIndex;
@@ -1318,6 +1764,7 @@ public sealed class MainForm : Form
         _grid.ClearSelection();
         ApplySavedColumnOrder();
         _suppressColumnOrderDirty = false;
+        _suppressColumnWidthDirty = false;
     }
 
     private void UpdateGridCells(IReadOnlyList<int> rows)
@@ -1505,6 +1952,7 @@ public sealed class MainForm : Form
         {
             _gridMenu.Items.Add(MakeMenu("在上方插入行", "在选中行上方插入一个空行", () => InsertGridRow(row, false), false));
             _gridMenu.Items.Add(MakeMenu("在下方插入行", "在选中行下方插入一个空行", () => InsertGridRow(row, true), false));
+            _gridMenu.Items.Add(BuildCustomRowMenu(row));
             _gridMenu.Items.Add(MakeMenu("删除当前行", "删除选中行及其数据", () => DeleteGridRow(row), false));
         }
         if (rowTarget && colTarget)
@@ -1547,6 +1995,7 @@ public sealed class MainForm : Form
         }
         _gridButton.DropDownItems.Add(RowMenu("在上方插入行", "在当前行上方插入一个空行", () => InsertGridRow(row, false)));
         _gridButton.DropDownItems.Add(RowMenu("在下方插入行", "在当前行下方插入一个空行", () => InsertGridRow(row, true)));
+        _gridButton.DropDownItems.Add(BuildCustomRowMenu(row, hasRow));
         _gridButton.DropDownItems.Add(RowMenu("删除当前行", "删除当前行及其数据", () => DeleteGridRow(row)));
         _gridButton.DropDownItems.Add(new ToolStripSeparator());
         _gridButton.DropDownItems.Add(ColMenu("在左侧插入列", "在当前列左侧插入一个新列", () => InsertGridColumn(col, false)));
@@ -1559,6 +2008,16 @@ public sealed class MainForm : Form
             _gridButton.DropDownItems.Add(BuildAlignMenu(col - 1));
             _gridButton.DropDownItems.Add(BuildHeaderAlignMenu(col - 1));
         }
+    }
+
+    /// <summary>构建“插入自定义行数”子菜单：输入任意数量，一次性插入多行。</summary>
+    private ToolStripMenuItem BuildCustomRowMenu(int row, bool enabled = true)
+    {
+        var menu = new ToolStripMenuItem("插入自定义行数");
+        menu.DropDownItems.Add(MakeMenu("在上方插入...", "输入行数并一次性插入多行", () => InsertCustomRows(row, false), false));
+        menu.DropDownItems.Add(MakeMenu("在下方插入...", "输入行数并一次性插入多行", () => InsertCustomRows(row, true), false));
+        menu.Enabled = enabled && row >= 0;
+        return menu;
     }
 
     /// <summary>构建“内容对齐”子菜单（只改列内容，不影响表头文字）。</summary>
@@ -1636,6 +2095,65 @@ public sealed class MainForm : Form
         RemapRowKeys(physical, +1, false);
         _snapshot.InsertRow(physical);
         RebuildAfterStructure();
+    }
+
+    /// <summary>询问用户要插入的行数，并在选中行上方/下方一次性插入多行。</summary>
+    private void InsertCustomRows(int gridRow, bool below)
+    {
+        int count = PromptRowCount();
+        if (count <= 0) return;
+        InsertGridRows(gridRow, below, count);
+    }
+
+    /// <summary>在网格行 gridRow 的上方(false)/下方(true)一次性插入 count 个空行。</summary>
+    private void InsertGridRows(int gridRow, bool below, int count)
+    {
+        if (_snapshot == null || count <= 0) return;
+        int physical;
+        if (gridRow >= 0 && gridRow < _snapshot.RowNumbers.Count)
+            physical = _snapshot.RowNumbers[gridRow] + (below ? 1 : 0);
+        else
+            physical = (_snapshot.RowNumbers.Count > 0 ? _snapshot.RowNumbers[^1] : _snapshot.MaxRow) + 1;
+
+        for (int i = 0; i < count; i++)
+            _pendingStructure.Add(new StructuralOp(_snapshot.SheetName, StructuralKind.InsertRow, physical));
+        _structureQueued = true;
+        RemapRowKeys(physical, count, false);
+        for (int i = 0; i < count; i++)
+            _snapshot.InsertRow(physical);
+        RebuildAfterStructure();
+    }
+
+    /// <summary>弹出“插入自定义行数”对话框，返回输入的行数；取消返回 0。</summary>
+    private int PromptRowCount()
+    {
+        using var f = new Form
+        {
+            Text = "插入自定义行数",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(340, 140),
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+        f.Controls.Add(new Label { Text = "请输入要插入的行数（如 100、110）：", AutoSize = true, Location = new Point(18, 22) });
+        var num = new NumericUpDown
+        {
+            DecimalPlaces = 0,
+            Minimum = 1,
+            Maximum = 200000,
+            Value = 1,
+            Location = new Point(18, 56),
+            Width = 150
+        };
+        f.Controls.Add(num);
+        var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Location = new Point(150, 98), Width = 80 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Location = new Point(238, 98), Width = 80 };
+        f.Controls.Add(ok);
+        f.Controls.Add(cancel);
+        f.AcceptButton = ok;
+        f.CancelButton = cancel;
+        return f.ShowDialog(this) == DialogResult.OK ? (int)num.Value : 0;
     }
 
     /// <summary>删除网格行 gridRow。</summary>
@@ -1972,6 +2490,7 @@ public sealed class MainForm : Form
                 dst.NonEmptyCount = src.NonEmptyCount;
                 dst.NumericCount = src.NumericCount;
                 dst.TotalRows = src.TotalRows;
+                dst.Width = src.Width;
                 changed = true;
             }
         }
@@ -2398,7 +2917,11 @@ public sealed class MainForm : Form
     }
 
     // ---------- 保存/刷新/导出 ----------
-    private void OnSave() => CommitPending();
+    private void OnSave()
+    {
+        if (!CommitPending(out var err) && !string.IsNullOrEmpty(err))
+            MessageBox.Show(this, err, "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
 
     private void OnSaveAs()
     {
@@ -2882,11 +3405,20 @@ public sealed class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (_wb != null && _dirtyCells.Count > 0)
+        if (_wb != null && HasUnsavedChanges())
         {
             var r = MessageBox.Show(this, "有未保存的改动，是否保存？", "确认", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
             if (r == DialogResult.Cancel) { e.Cancel = true; return; }
-            if (r == DialogResult.Yes) CommitPending();
+            if (r == DialogResult.Yes)
+            {
+                if (!CommitPending(out var err))
+                {
+                    MessageBox.Show(this, string.IsNullOrEmpty(err) ? "保存失败，请检查文件是否被占用。" : err,
+                        "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    e.Cancel = true;
+                    return;
+                }
+            }
         }
         _watcher?.Dispose();
         _autoSaveTimer.Stop();
@@ -2900,7 +3432,7 @@ public sealed class MainForm : Form
 
     private void UpdateTitle()
     {
-        var dirty = _dirtyCells.Count > 0 ? "（有未保存改动）" : "";
+        var dirty = HasUnsavedChanges() ? "（有未保存改动）" : "";
         Text = "GameCurve - 游戏数据曲线编辑器" + (_wb != null ? " - " + Path.GetFileName(_wb.Path) : "") + dirty;
     }
 
@@ -3081,7 +3613,17 @@ public sealed class MainForm : Form
                             if (_rowToGridIndex.TryGetValue(first.RowNumber, out var firstGi) && firstGi >= 0 && firstGi < _grid.Rows.Count)
                             {
                                 _grid.FirstDisplayedScrollingRowIndex = Math.Max(0, firstGi);
-                                _grid.FirstDisplayedScrollingColumnIndex = Math.Max(0, col - 1);
+                                // 目标滚动列不能是冻结列（行号列 Frozen=true），否则抛 InvalidOperationException
+                                int frozenCount = 0;
+                                foreach (DataGridViewColumn c in _grid.Columns)
+                                {
+                                    if (!c.Frozen) break;
+                                    frozenCount++;
+                                }
+                                int scrollCol = Math.Max(frozenCount, col - 1);
+                                if (scrollCol > _grid.Columns.Count - 1)
+                                    scrollCol = _grid.Columns.Count - 1;
+                                _grid.FirstDisplayedScrollingColumnIndex = scrollCol;
                                 _grid.CurrentCell = _grid.Rows[firstGi].Cells[col];
                             }
                         }
