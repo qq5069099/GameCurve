@@ -164,6 +164,121 @@ public sealed class WorkbookModel : IDisposable
         return wsPart;
     }
 
+    /// <summary>
+    /// 批量写回某工作表的列宽（字符单位）到 &lt;cols&gt;。只更新宽度/自定义宽度标志，
+    /// 保留各列已有的样式与隐藏状态；列号超出当前表范围的非目标列也会被保留。
+    /// </summary>
+    public bool TryWriteColumnWidths(string sheetName, IReadOnlyList<(int Col, double Width)> widths, out string? error)
+    {
+        error = null;
+        if (widths.Count == 0) return true;
+        try
+        {
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            var wsPart = GetWorksheetPart(wbPart, sheetName);
+            WriteColumnWidths(wsPart, widths);
+            wsPart.Worksheet.Save();
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存列宽。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存列宽失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>重建工作表的 &lt;cols&gt; 元素，合并连续且属性一致的列，并保持位于 SheetData 之前。</summary>
+    private static void WriteColumnWidths(WorksheetPart wsPart, IReadOnlyList<(int Col, double Width)> widths)
+    {
+        var worksheet = wsPart.Worksheet;
+        var sheetData = worksheet.GetFirstChild<SheetData>();
+        var oldCols = worksheet.GetFirstChild<Columns>();
+
+        // 记录每列现有的宽度/样式/隐藏状态（展开 min..max 范围）
+        var info = new SortedDictionary<int, (double? Width, bool Custom, uint Style, bool Hidden)>();
+        if (oldCols != null)
+        {
+            foreach (var col in oldCols.Elements<Column>())
+            {
+                uint min = col.Min?.Value ?? 0;
+                uint max = col.Max?.Value ?? min;
+                if (min == 0) continue;
+                uint style = col.Style?.Value ?? 0;
+                bool hidden = col.Hidden?.Value ?? false;
+                bool custom = col.CustomWidth?.Value ?? false;
+                double? width = col.Width?.Value;
+                for (uint c = min; c <= max; c++)
+                    info[(int)c] = (width, custom, style, hidden);
+            }
+        }
+
+        // 用新宽度覆盖，保留原本的样式/隐藏状态
+        foreach (var (col, width) in widths)
+        {
+            int colNum = col + 1;
+            if (colNum < 1) continue;
+            var prev = info.GetValueOrDefault(colNum, (null, false, 0u, false));
+            info[colNum] = (width, true, prev.Style, prev.Hidden);
+        }
+
+        if (info.Count == 0) return;
+
+        var result = new Columns();
+        int? runStart = null;
+        int? runEnd = null;
+        (double? Width, bool Custom, uint Style, bool Hidden)? run = null;
+
+        foreach (var kv in info)
+        {
+            int colNum = kv.Key;
+            var cur = kv.Value;
+            bool same = run.HasValue
+                && runEnd == colNum - 1
+                && Math.Abs((run.Value.Width ?? 0) - (cur.Width ?? 0)) < 1e-9
+                && run.Value.Custom == cur.Custom
+                && run.Value.Style == cur.Style
+                && run.Value.Hidden == cur.Hidden;
+            if (same)
+            {
+                runEnd = colNum;
+                continue;
+            }
+            if (runStart.HasValue)
+                AppendCol(result, runStart.Value, runEnd!.Value, run!.Value);
+            runStart = colNum;
+            runEnd = colNum;
+            run = cur;
+        }
+        if (runStart.HasValue)
+            AppendCol(result, runStart.Value, runEnd!.Value, run!.Value);
+
+        if (oldCols != null) worksheet.RemoveChild(oldCols);
+        if (sheetData != null) worksheet.InsertBefore(result, sheetData);
+        else worksheet.AppendChild(result);
+    }
+
+    private static void AppendCol(Columns cols, int min, int max, (double? Width, bool Custom, uint Style, bool Hidden) info)
+    {
+        var col = new Column
+        {
+            Min = (uint)min,
+            Max = (uint)max,
+            Style = info.Style,
+            Hidden = info.Hidden,
+            CustomWidth = info.Custom
+        };
+        if (info.Width.HasValue) col.Width = info.Width.Value;
+        cols.AppendChild(col);
+    }
+
     /// <summary>加载某工作表并生成列元信息与网格快照。</summary>
     public SheetSnapshot LoadSheet(string sheetName)
     {
@@ -237,6 +352,7 @@ public sealed class WorkbookModel : IDisposable
 
         // 建立列元信息
         var samples = PrecomputeSamples(rows, maxRow, maxCol, headerRow);
+        var colWidths = ReadColumnWidths(wsPart, maxCol);
         for (int c = 0; c < maxCol; c++)
         {
             var raw = headerRaw[c];
@@ -263,7 +379,8 @@ public sealed class WorkbookModel : IDisposable
                 IsInteger = isInteger,
                 NonEmptyCount = nonEmpty,
                 NumericCount = numericCount,
-                TotalRows = Math.Max(0, maxRow - headerRow)
+                TotalRows = Math.Max(0, maxRow - headerRow),
+                Width = colWidths.TryGetValue(c + 1, out var w) ? w : null
             });
         }
 
@@ -329,6 +446,24 @@ public sealed class WorkbookModel : IDisposable
             if (score > bestScore) { bestScore = score; best = r; }
         }
         return bestScore > 0 ? best : 1;
+    }
+
+    /// <summary>从工作表的 &lt;cols&gt; 元素读取每列的宽度（字符单位），key 为 1 基列号。</summary>
+    private static Dictionary<int, double> ReadColumnWidths(WorksheetPart wsPart, int maxCol)
+    {
+        var result = new Dictionary<int, double>();
+        var cols = wsPart.Worksheet.GetFirstChild<Columns>();
+        if (cols == null) return result;
+        foreach (var col in cols.Elements<Column>())
+        {
+            uint min = col.Min?.Value ?? 0;
+            uint max = col.Max?.Value ?? min;
+            if (min == 0) continue;
+            if (col.Width?.Value is not double w) continue;
+            for (uint c = min; c <= max; c++)
+                result[(int)c] = w;
+        }
+        return result;
     }
 
     /// <summary>批量写回单元格，返回是否成功；失败时输出原因（如文件被占用）。</summary>

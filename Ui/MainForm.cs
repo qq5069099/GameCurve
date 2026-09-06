@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using GameCurve.Excel;
 using GameCurve.Models;
@@ -23,15 +24,17 @@ public sealed class MainForm : Form
     private bool _structureQueued;
     private bool _columnOrderDirty;
     private bool _suppressColumnOrderDirty;
+    private bool _columnWidthDirty;
+    private bool _suppressColumnWidthDirty;
     private TextBox? _headerEdit;
     private int _headerEditPhysicalCol = -1;   // -1 表示没有在编辑列名
 
     private readonly ToolStrip _tool = new();
     private readonly ToolStripMenuItem _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
-    private readonly ToolStripDropDownButton _openMenu = new("打开");
-    private readonly ToolStripDropDownButton _saveMenu = new("保存");
+    private readonly ToolStripDropDownButton _openMenu = new("文件");
+    private readonly ToolStripDropDownButton _editMenu = new("编辑");
     private readonly ToolStripDropDownButton _gridButton = new("表格");
-    private readonly ToolStripDropDownButton _layoutButton = new("布局");
+    private readonly ToolStripDropDownButton _viewButton = new("视图");
     private ToolStripMenuItem _gridMaxItem = null!;
     private ToolStripMenuItem _gridBottomItem = null!;
     private ToolStripMenuItem _gridRightItem = null!;
@@ -203,28 +206,32 @@ public sealed class MainForm : Form
         _tool.GripStyle = ToolStripGripStyle.Hidden;
         _openMenu.DropDownOpening += (s, e) => RebuildOpenMenu();
         _tool.Items.Add(_openMenu);
-        // “保存”主菜单统一放置：保存、另存为、自动保存
-        _saveMenu.DropDownItems.Add(MakeMenu("保存", "把当前改动写回 Excel 文件（Ctrl+S）", OnSave, false));
-        _saveMenu.DropDownItems.Add(MakeMenu("另存为", "复制一份并另存为新文件", OnSaveAs, false));
-        _saveMenu.DropDownItems.Add(_autoSaveCheck);
-        _tool.Items.Add(_saveMenu);
-        AddButton("刷新", "重新从磁盘读取当前工作表", OnReload);
-        _tool.Items.Add(new ToolStripSeparator());
-        AddButton("撤销", "撤销上次编辑（Ctrl+Z）", () => Undo());
-        AddButton("重做", "重做上次撤销（Ctrl+Y）", () => Redo());
-        _tool.Items.Add(new ToolStripSeparator());
-        AddButton("导出PNG", "把当前曲线图导出为 PNG 图片", OnExport);
-        _gridButton.DropDownOpening += (s, e) => BuildGridToolbarMenu();
-        _tool.Items.Add(_gridButton);
-        // “布局”菜单统一放置表格的布局切换：最大化/还原、置底/靠右
+        // “编辑”菜单统一放置：刷新、撤销、重做
+        var reloadItem = MakeMenu("刷新", "重新从磁盘读取当前工作表", OnReload, false);
+        var undoItem = MakeMenu("撤销", "撤销上次编辑（Ctrl+Z）", () => Undo(), false);
+        var redoItem = MakeMenu("重做", "重做上次撤销（Ctrl+Y）", () => Redo(), false);
+        _editMenu.DropDownItems.Add(reloadItem);
+        _editMenu.DropDownItems.Add(new ToolStripSeparator());
+        _editMenu.DropDownItems.Add(undoItem);
+        _editMenu.DropDownItems.Add(redoItem);
+        _editMenu.DropDownOpening += (s, e) =>
+        {
+            reloadItem.Enabled = _wb != null;
+            undoItem.Enabled = _undo.Count > 0;
+            redoItem.Enabled = _redo.Count > 0;
+        };
+        _tool.Items.Add(_editMenu);
+        // “视图”菜单统一放置表格的视图切换：最大化/还原、置底/靠右
         _gridMaxItem = MakeMenu("表格最大化", "把表格铺满主窗口，便于编辑数据（F11）", ToggleGridMaximize, false);
         _gridBottomItem = MakeMenu("表格置底", "表格放在曲线区下方", () => SetGridSide(false), true);
         _gridRightItem = MakeMenu("表格靠右", "表格与曲线区左右并列", () => SetGridSide(true), false);
-        _layoutButton.DropDownItems.Add(_gridMaxItem);
-        _layoutButton.DropDownItems.Add(new ToolStripSeparator());
-        _layoutButton.DropDownItems.Add(_gridBottomItem);
-        _layoutButton.DropDownItems.Add(_gridRightItem);
-        _tool.Items.Add(_layoutButton);
+        _viewButton.DropDownItems.Add(_gridMaxItem);
+        _viewButton.DropDownItems.Add(new ToolStripSeparator());
+        _viewButton.DropDownItems.Add(_gridBottomItem);
+        _viewButton.DropDownItems.Add(_gridRightItem);
+        _tool.Items.Add(_viewButton);
+        _gridButton.DropDownOpening += (s, e) => BuildGridToolbarMenu();
+        _tool.Items.Add(_gridButton);
         UpdateLayoutMenu();
         _tool.Dock = DockStyle.Top;
         Controls.Add(_tool);
@@ -408,6 +415,7 @@ public sealed class MainForm : Form
         _grid.AllowUserToResizeColumns = true;
         _grid.AllowUserToOrderColumns = true;           // 列名按住拖拽移动顺序
         _grid.ColumnDisplayIndexChanged += (s, e) => { if (!_suppressColumnOrderDirty) _columnOrderDirty = true; };
+        _grid.ColumnWidthChanged += OnGridColumnWidthChanged;
         _grid.RowHeadersVisible = true;
         _grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;  // 点击只选中，键入/F2/双击进入编辑（Excel 式）
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
@@ -546,6 +554,84 @@ public sealed class MainForm : Form
         ApplySheetData(prep.TargetLoad);
         UpdateTitle();
         CloseSplash();
+    }
+
+    /// <summary>关闭当前工作簿并清空界面状态。</summary>
+    private void CloseCurrentFile()
+    {
+        if (_busyLoading || _wb == null) return;
+        if (HasUnsavedChanges())
+        {
+            var r = MessageBox.Show(this, "有未保存的改动，是否保存？", "确认", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel) return;
+            if (r == DialogResult.Yes) CommitPending();
+        }
+        _watcher?.Dispose();
+        _watcher = null;
+        _autoSaveTimer.Stop();
+        _reloadTimer.Stop();
+        _wb?.Dispose();
+        _wb = null;
+        _snapshot = null;
+        _activeSheet = "";
+        _autoFocusSheet = "";
+        _autoFocusCol = -1;
+        _checkedCols = new List<CurveColumnOption>();
+        _xColumn = null;
+        _activeYColumn = null;
+        _series.Clear();
+        _curve.SetSeries(new List<CurveSeriesView>(), -1);
+        _curve.ClearSelection();
+        _curve.XAxisLabel = "";
+        _curve.YAxisLabel = "";
+        _committed.Clear();
+        _editing.Clear();
+        _rowToGridIndex.Clear();
+        _dirtyCells.Clear();
+        _pendingUndoRows.Clear();
+        _subEditOldText.Clear();
+        _undo.Clear();
+        _redo.Clear();
+        _pendingStructure.Clear();
+        _pendingHeaderRename.Clear();
+        _pendingHeaderAlign.Clear();
+        _pendingColumnAlign.Clear();
+        _structureQueued = false;
+        _columnOrderDirty = false;
+        _grid.Columns.Clear();
+        _grid.Rows.Clear();
+        _colsChecked.Items.Clear();
+        _xCombo.Items.Clear();
+        _xCombo.Items.Add("行号");
+        _xCombo.SelectedIndex = 0;
+        _statLabel.Text = "";
+        _sheetStrip.SuspendLayout();
+        _sheetStrip.Controls.Clear();
+        _sheetButtons.Clear();
+        _sheetStrip.ResumeLayout();
+        _statusLabel.Text = "已关闭当前文件";
+        RebuildOpenMenu();
+        UpdateTitle();
+    }
+
+    /// <summary>用系统关联程序（Excel）打开当前工作簿。</summary>
+    private void OpenCurrentInExcel()
+    {
+        if (_wb == null) return;
+        string path = _wb.Path;
+        if (!File.Exists(path))
+        {
+            MessageBox.Show(this, "当前文件不存在，无法用 Excel 打开。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try
+        {
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "无法用 Excel 打开当前文件：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void StartSheetLoad(string name)
@@ -2868,11 +2954,44 @@ public sealed class MainForm : Form
     private void RebuildOpenMenu()
     {
         _openMenu.DropDownItems.Clear();
+        // ---------- 打开 / 文件 ----------
         var pick = new ToolStripMenuItem("选择文件...");
         pick.Click += (s, e) => OnOpen();
         _openMenu.DropDownItems.Add(pick);
+
+        var close = new ToolStripMenuItem("关闭当前文件");
+        close.Enabled = _wb != null;
+        close.Click += (s, e) => CloseCurrentFile();
+        _openMenu.DropDownItems.Add(close);
+
+        var openExcel = new ToolStripMenuItem("用Excel打开当前文件");
+        openExcel.Enabled = _wb != null && File.Exists(_wb.Path);
+        openExcel.Click += (s, e) => OpenCurrentInExcel();
+        _openMenu.DropDownItems.Add(openExcel);
+
         _openMenu.DropDownItems.Add(new ToolStripSeparator());
 
+        // ---------- 保存 ----------
+        var save = new ToolStripMenuItem("保存");
+        save.ToolTipText = "把当前改动写回 Excel 文件（Ctrl+S）";
+        save.Click += (s, e) => OnSave();
+        _openMenu.DropDownItems.Add(save);
+
+        var saveAs = new ToolStripMenuItem("另存为");
+        saveAs.ToolTipText = "复制一份并另存为新文件";
+        saveAs.Click += (s, e) => OnSaveAs();
+        _openMenu.DropDownItems.Add(saveAs);
+
+        _openMenu.DropDownItems.Add(_autoSaveCheck);
+
+        var exportPng = new ToolStripMenuItem("导出PNG");
+        exportPng.ToolTipText = "把当前曲线图导出为 PNG 图片";
+        exportPng.Click += (s, e) => OnExport();
+        _openMenu.DropDownItems.Add(exportPng);
+
+        _openMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        // ---------- 最近文件 ----------
         string? folder = Path.GetDirectoryName(_wb?.Path ?? _settings.LastFile);
         if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
         {

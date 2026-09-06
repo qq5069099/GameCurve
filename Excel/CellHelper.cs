@@ -57,6 +57,23 @@ public static class CellHelper
         return false;
     }
 
+    /// <summary>
+    /// 把 Excel 列宽（字符单位）换算为像素宽度（用于 DataGridView）。
+    /// 采用默认字体（Calibri 11，最大数字宽度 7）下的常见换算：像素 = round(字符宽 * 7 + 5)。
+    /// </summary>
+    public static int CharacterWidthToPixels(double width)
+    {
+        if (width < 1) width = 1;
+        return (int)Math.Round(width * 7.0 + 5.0, MidpointRounding.AwayFromZero);
+    }
+
+    /// <summary>把像素宽度换算回 Excel 列宽（字符单位），用于写回 &lt;cols&gt;。</summary>
+    public static double PixelsToCharacterWidth(int pixels)
+    {
+        if (pixels < 1) pixels = 1;
+        return Math.Max(1.0, (pixels - 5.0) / 7.0);
+    }
+
     public static string ToCellReference(int columnIndex, int rowNumber) => $"{ColumnIndexToLetter(columnIndex)}{rowNumber}";
 
     public static string ColumnIndexToLetter(int columnIndex)

@@ -25,6 +25,9 @@ public sealed class ColumnMeta
     /// <summary>原始表头文本。</summary>
     public string HeaderRaw { get; set; } = "";
 
+    /// <summary>列宽（Excel 字符单位）；null 表示文件未显式设置，使用默认宽度。</summary>
+    public double? Width { get; set; }
+
     /// <summary>该列表头是否为空。</summary>
     public bool IsEmpty { get; set; }
 
