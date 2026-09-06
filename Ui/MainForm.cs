@@ -1957,9 +1957,10 @@ public sealed class MainForm : Form
             string oldText = CellText(col, row);
             if (text == oldText) continue;
 
+            // 先更新快照，再刷新曲线：子曲线列（数组/JSON）需要读到新值才能决定点的新增/删除
+            UpdateSnapshotCell(row, col, text);
             ApplyPlottedCellChange(col, row, text);
             SyncActiveBaseline(col, row, text);
-            UpdateSnapshotCell(row, col, text);
             _dirtyCells.Add((col, row));
             changed.Add((col, row, oldText, text));
             touched.Add((col, row));
@@ -1994,9 +1995,14 @@ public sealed class MainForm : Form
     {
         int si = _checkedCols.FindIndex(c => c.Column.ColumnIndex == col);
         if (si < 0) return;
-        // 子曲线列整格为数组/JSON，直接编辑按非标量处理，避免误删曲线点
-        if (_checkedCols[si].IsSubCurve && !CellHelper.TryParseDouble(text, out _))
+        // 子曲线列整格为数组/JSON：按拆分读取值决定该行点的增删。空白/不可解析则删除点；
+        // 手工填入合法 JSON 后曲线按拆分值补充显示对应点，空白一律不留点。
+        if (_checkedCols[si].IsSubCurve)
+        {
+            RefreshSubSeriesForColumnRow(col, row);
+            SyncSubCurveBaseline(col, row);
             return;
+        }
         if (CellHelper.TryParseDouble(text, out var y))
         {
             int xgi = _rowToGridIndex.TryGetValue(row, out var g) ? g : -1;
@@ -2014,6 +2020,18 @@ public sealed class MainForm : Form
             _curve.RemoveSeriesPoint(si, row);
         }
         _curve.Invalidate();
+    }
+
+    /// <summary>子曲线列（数组/JSON）手动编辑后，同步当前编辑列的基线值，避免拖点撤销回退到旧值。</summary>
+    private void SyncSubCurveBaseline(int col, int row)
+    {
+        if (_activeYColumn == null || !_activeYColumn.IsSubCurve || col != _activeYColumn.Column.ColumnIndex) return;
+        if (TryGetPoint(row, out var sp))
+        {
+            _editing[row] = (sp.X, sp.Y);
+            _committed[row] = (sp.X, sp.Y);
+        }
+        else { _editing.Remove(row); _committed.Remove(row); }
     }
 
     private void OnGridSelectionChanged(object? sender, EventArgs e)
@@ -2998,6 +3016,13 @@ public sealed class MainForm : Form
         var snap = _snapshot;
         var opt = _activeYColumn;
 
+        // 单元格拆分列（数组/JSON）：点由单元格内容拆分而来，空白必须手工在单元格填入，曲线操作不允许自动补充空白。
+        if (opt.IsSubCurve)
+        {
+            _statusLabel.Text = "该列为单元格拆分列（数组/JSON），不允许补充空白单元格，请手工在单元格中填入内容";
+            return;
+        }
+
         // 收集每个数据行的 (行号, X, 是否有Y值, Y值)。X 无法读取的行直接跳过（无法定位）。
         var rows = new List<(int Row, double X, bool HasValue, double Y)>(snap.RowNumbers.Count);
         for (int gi = 0; gi < snap.RowNumbers.Count; gi++)
@@ -3192,6 +3217,12 @@ public sealed class MainForm : Form
                 {
                     x = existing.X;
                     xEditable = existing.XEditable;
+                }
+                else if (_xColumn != null && gi >= 0 &&
+                         SubCurveHelper.TryReadValue(_snapshot, _xColumn, gi, out var xv))
+                {
+                    x = xv;
+                    xEditable = true;
                 }
                 _curve.SetSeriesPoint(si, row, x, y.Value, xEditable, gi + 1);
             }
@@ -3596,11 +3627,19 @@ public sealed class MainForm : Form
         var opt = _activeYColumn;
         int col = opt.Column.ColumnIndex;
         var changed = new List<(int, int, string, string)>();
+        int skippedBlank = 0;
 
         foreach (var (row, x, y) in writes)
         {
             if (col < 0 || col >= _snapshot.ColumnCount) continue;
             if (!_rowToGridIndex.TryGetValue(row, out var gi) || gi < 0 || gi >= _snapshot.Grid.Count) continue;
+
+            // 单元格拆分列（数组/JSON）：该行无拆分值时跳过，不生成曲线点也不向空白单元格写入
+            if (opt.IsSubCurve && !SubCurveHelper.TryReadValue(_snapshot, opt, gi, out _))
+            {
+                skippedBlank++;
+                continue;
+            }
 
             // 曲线点始终按拟合值更新，且与单元格存储值保持一致（整数列取整），
             // 否则仅改写“取整后发生变化”的行会让折线新旧值混杂，看起来就不是直线。
@@ -3620,6 +3659,10 @@ public sealed class MainForm : Form
             changed.Add((col, row, oldText, newText));
         }
 
+        if (skippedBlank > 0)
+            _statusLabel.Text = changed.Count > 0
+                ? $"已更新 {changed.Count} 个点，跳过 {skippedBlank} 个空白（数组/JSON 列不允许自动补充）"
+                : $"已跳过 {skippedBlank} 个空白单元格（数组/JSON 列不允许自动补充，请手工填入）";
         if (changed.Count == 0) return;
         _undo.Add(new EditCmd(changed));
         _redo.Clear();

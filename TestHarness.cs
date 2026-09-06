@@ -17,6 +17,8 @@ internal static class TestHarness
             return Render(args);
         if (args.Length > 1 && args[1] == "--structure")
             return StructureTest(args);
+        if (args.Length > 1 && args[1] == "--subcurve")
+            return SubCurveTest(args);
         if (args.Length > 1 && args[1] == "--columnorder")
             return ColumnOrderTest(args);
         if (args.Length > 1 && args[1] == "--columnwidth")
@@ -99,6 +101,74 @@ internal static class TestHarness
         Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
 
         try { File.Delete(copy); } catch { }
+        return ok ? 0 : 3;
+    }
+
+    /// <summary>
+    /// 子曲线（单元格拆分列）约定：空白/空值单元格不生成曲线点，曲线操作中的 SetValue
+    /// 不可把空白单元格自动改写为 JSON，必须由用户手工在单元格填入内容。
+    /// </summary>
+    private static int SubCurveTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm";
+        Console.WriteLine("子曲线测试文件: " + file);
+
+        var wb = new WorkbookModel();
+        wb.Open(file);
+
+        // 找到第一个含子曲线（数组/JSON）的工作表
+        ColumnMeta? subCol = null;
+        CurveColumnOption? sub = null;
+        SheetSnapshot? subSnap = null;
+        foreach (var sheet in wb.SheetNames)
+        {
+            var snap = wb.LoadSheet(sheet);
+            var opt = SubCurveHelper.BuildOptions(snap).FirstOrDefault(o => o.IsSubCurve);
+            if (opt != null) { subSnap = snap; subCol = opt.Column; sub = opt; break; }
+        }
+
+        if (sub == null || subSnap == null)
+        {
+            Console.WriteLine("!! 未找到子曲线列");
+            return 2;
+        }
+
+        int col = sub.Column.ColumnIndex;
+        bool ok = true;
+
+        // 1) 空白单元格：TryReadValue 应返回 false，且 SetValue("", ...) 不应改写原格
+        string setBlank = SubCurveHelper.SetValue("", sub, 3.0);
+        bool blankNoWrite = setBlank == "";
+        Console.WriteLine("子曲线 SetValue(空白格) 不改写: " + (blankNoWrite ? "OK" : "失败"));
+        ok &= blankNoWrite;
+
+        // 2) 找一个确实有值的行：TryReadValue 为真，且 SetValue 能改写原格
+        int goodGi = Enumerable.Range(0, subSnap.Grid.Count)
+            .FirstOrDefault(gi => SubCurveHelper.TryReadValue(subSnap, sub, gi, out _), -1);
+        bool goodVal = goodGi >= 0;
+        double v0 = 0;
+        if (goodGi >= 0)
+            goodVal = SubCurveHelper.TryReadValue(subSnap, sub, goodGi, out v0);
+        bool goodWrite = goodVal;
+        if (goodVal)
+        {
+            string raw = subSnap.Grid[goodGi][col] ?? "";
+            string after = SubCurveHelper.SetValue(raw, sub, v0 + 1.0);
+            goodWrite = after != raw;
+        }
+        Console.WriteLine("子曲线有值格可读取/改写: " + (goodVal && goodWrite ? "OK" : "失败"));
+        ok &= goodVal && goodWrite;
+
+        // 3) 找空白行：TryReadValue 为 false（不生成曲线点）
+        int blankGi = Enumerable.Range(0, subSnap.Grid.Count)
+            .FirstOrDefault(gi => string.IsNullOrWhiteSpace(subSnap.Grid[gi][col] ?? ""), -1);
+        bool blankNoPoint = blankGi >= 0 && !SubCurveHelper.TryReadValue(subSnap, sub, blankGi, out _);
+        Console.WriteLine("子曲线空白行不生成点: " + (blankNoPoint ? "OK" : "失败"));
+        ok &= blankNoPoint;
+
+        wb.Dispose();
         return ok ? 0 : 3;
     }
 
