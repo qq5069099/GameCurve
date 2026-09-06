@@ -82,7 +82,7 @@ public static class SubCurveHelper
                     {
                         Column = col,
                         SubIndex = i,
-                        DisplayName = $"{ShortName(col)}[{i}]"
+                        DisplayName = $"{BaseName(col)}[{i}]"
                     });
             }
             else if (col.IsNumericScalar)
@@ -150,7 +150,7 @@ public static class SubCurveHelper
                 IsJsonValue = true,
                 JsonIndex = meta.Index,
                 JsonId = meta.HasId ? meta.Key : "",
-                DisplayName = string.IsNullOrEmpty(suffix) ? ShortName(col) : $"{ShortName(col)}[{suffix}]"
+                DisplayName = string.IsNullOrEmpty(suffix) ? BaseName(col) : $"{BaseName(col)}[{suffix}]"
             });
         }
     }
@@ -162,12 +162,11 @@ public static class SubCurveHelper
         return col >= 0 && col < row.Length ? row[col] ?? "" : "";
     }
 
-    public static string ShortName(ColumnMeta col)
-    {
-        string label = col.Label ?? col.Name;
-        if (string.IsNullOrWhiteSpace(label)) label = col.Letter;
-        return label.Trim();
-    }
+    /// <summary>
+    /// 子曲线显示名的基名：使用原始 Excel 表头文本，保留冒号等原始字符，
+    /// 拆分出的子曲线只在此基础上追加后缀。
+    /// </summary>
+    private static string BaseName(ColumnMeta col) => col.DisplayName;
 
     /// <summary>从某行单元格里提取子曲线值。</summary>
     public static bool TryReadValue(SheetSnapshot? snap, CurveColumnOption opt, int gi, out double value)

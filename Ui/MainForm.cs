@@ -15,6 +15,8 @@ public sealed class MainForm : Form
     private readonly CurveEditor _curve = new() { Dock = DockStyle.Fill };
     private readonly DataGridView _grid = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false };
     private readonly ToolTip _tip = new() { AutoPopDelay = 12000, InitialDelay = 500, ReshowDelay = 120 };
+    /// <summary>当前已在“曲线列 (Y) 多选”上显示的提示文本，避免每次移动都重设 ToolTip。</summary>
+    private string? _colCheckedTipText;
     private readonly ContextMenuStrip _gridMenu = new();
     private (int Row, int Col, GridArea Area) _gridTarget = (-1, -1, GridArea.None);
     private readonly List<StructuralOp> _pendingStructure = new();
@@ -450,6 +452,7 @@ public sealed class MainForm : Form
             _preferredListChecked = e.NewValue == CheckState.Checked;
             BeginInvoke((Action)OnSelectionChanged);
         };
+        _colsChecked.MouseMove += OnColumnListMouseMove;
         _xCombo.SelectedIndexChanged += (s, e) => OnSelectionChangedSafe();
         _stepUpDown.ValueChanged += (s, e) => _curve.KeyboardStep = (double)_stepUpDown.Value;
         _fitTypeCombo.SelectedIndexChanged += (s, e) => _fitDegree.Enabled = SelectedFitModel() == FitModel.Polynomial;
@@ -487,6 +490,36 @@ public sealed class MainForm : Form
             // Delete 只清除“表格(excel)”拥有焦点时的单元格值；曲线选中点、曲线获得焦点时不触发删除
             else if (e.KeyCode == Keys.Delete && !e.Control && _grid.ContainsFocus) { ClearSelection(); e.Handled = true; }
         };
+    }
+
+    /// <summary>曲线列 (Y) 多选：当鼠标悬停且该项文字显示不全时，提示完整名称。</summary>
+    private void OnColumnListMouseMove(object? sender, MouseEventArgs e)
+    {
+        int idx = _colsChecked.IndexFromPoint(e.Location);
+        string? text = idx >= 0 ? _colsChecked.Items[idx]?.ToString() : null;
+        if (string.IsNullOrEmpty(text))
+        {
+            if (_colCheckedTipText != null)
+            {
+                _colCheckedTipText = null;
+                _tip.Hide(_colsChecked);
+                _tip.SetToolTip(_colsChecked, "");
+            }
+            return;
+        }
+
+        var rect = _colsChecked.GetItemRectangle(idx);
+        float scale = _colsChecked.DeviceDpi / 96f;
+        int checkboxGap = (int)Math.Ceiling(16 * scale) + 2; // 复选框 + 文字左边距
+        int avail = Math.Max(0, rect.Width - checkboxGap);
+        int textWidth = TextRenderer.MeasureText(text, _colsChecked.Font).Width;
+        string tip = textWidth > avail ? text : "";
+        if (tip != _colCheckedTipText)
+        {
+            _colCheckedTipText = tip;
+            if (tip.Length == 0) _tip.Hide(_colsChecked);
+            _tip.SetToolTip(_colsChecked, tip);
+        }
     }
 
     // ---------- 打开 / 工作表 ----------

@@ -1,5 +1,6 @@
 using GameCurve.Excel;
 using GameCurve.Models;
+using GameCurve.Services;
 using GameCurve.Ui;
 
 namespace GameCurve;
@@ -35,6 +36,15 @@ internal static class TestHarness
         var wb = new WorkbookModel();
         wb.Open(file);
         Console.WriteLine("工作表: " + string.Join(" | ", wb.SheetNames));
+
+        // 临时验证：打印每个工作表的曲线选项显示名
+        foreach (var s in wb.SheetNames)
+        {
+            var sn = wb.LoadSheet(s);
+            Console.WriteLine($"[{s}] 曲线选项:");
+            foreach (var o in SubCurveHelper.BuildOptions(sn).Take(14))
+                Console.WriteLine("   " + o.DisplayName);
+        }
 
         string? firstSheetWithData = null;
         foreach (var sheet in wb.SheetNames)
