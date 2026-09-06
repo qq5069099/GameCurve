@@ -16,6 +16,8 @@ internal static class TestHarness
             return Render(args);
         if (args.Length > 1 && args[1] == "--structure")
             return StructureTest(args);
+        if (args.Length > 1 && args[1] == "--columnorder")
+            return ColumnOrderTest(args);
 
         string file = args.Length > 1 && File.Exists(args[1])
             ? args[1]
@@ -170,6 +172,51 @@ internal static class TestHarness
 
         try { File.Delete(copy); } catch { }
         return rowShifted && restored && colRestored && memRow && memRowBack && memCol && memColBack && memRename ? 0 : 3;
+    }
+
+    private static int ColumnOrderTest(string[] args)
+    {
+        string file = args.Length > 2 && File.Exists(args[2])
+            ? args[2]
+            : @"C:\Users\50690\Desktop\github\GameCurve\test\excel\Base@全局数据.xlsm";
+        Console.WriteLine("列顺序测试文件: " + file);
+
+        string copy = Path.Combine(Path.GetTempPath(), "gc_colorder_" + Guid.NewGuid().ToString("N")[..8] + ".xlsm");
+        File.Copy(file, copy, true);
+        bool allOk = true;
+        WorkbookModel? wb2 = null;
+        try
+        {
+            var wb = new WorkbookModel();
+            wb.Open(copy);
+            string sheet = wb.SheetNames.First();
+            int colCount = wb.LoadSheet(sheet).ColumnCount;
+            var order = Enumerable.Range(0, colCount).Reverse().ToList(); // 倒序
+            bool writeOk = wb.TryWriteColumnOrder(sheet, order, out var err);
+            Console.WriteLine("写列顺序: " + (writeOk ? "OK" : "失败 " + err));
+            if (!writeOk) return 3;
+            wb.Dispose();
+
+            wb2 = new WorkbookModel();
+            wb2.Open(copy);
+            bool hiddenFiltered = !wb2.SheetNames.Contains("__GameCurve__", StringComparer.OrdinalIgnoreCase);
+            Console.WriteLine("内部配置表已隐藏: " + (hiddenFiltered ? "OK" : "失败"));
+            var read = wb2.GetColumnOrder(sheet);
+            bool orderOk = read != null && read.SequenceEqual(order);
+            Console.WriteLine("重读列顺序: " + (orderOk ? "OK" : "失败 " + (read == null ? "null" : string.Join(",", read))));
+            allOk &= hiddenFiltered && orderOk;
+
+            using var zip = System.IO.Compression.ZipFile.OpenRead(copy);
+            bool hasVba = zip.Entries.Any(e => e.FullName.Contains("vba", StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("宏保留: " + (hasVba ? "是" : "否"));
+            allOk &= hasVba;
+        }
+        finally
+        {
+            wb2?.Dispose();
+            try { File.Delete(copy); } catch { }
+        }
+        return allOk ? 0 : 3;
     }
 
     private static int Render(string[] args)

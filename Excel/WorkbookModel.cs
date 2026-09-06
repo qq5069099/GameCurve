@@ -23,6 +23,11 @@ public sealed class WorkbookModel : IDisposable
 
     private readonly Dictionary<string, SheetSnapshot> _cache = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>用于持久化各工作表列显示顺序的非常隐藏内部配置表名。</summary>
+    private const string OrderSheetName = "__GameCurve__";
+    /// <summary>打开时从配置表读入的列顺序（按工作表名缓存）。</summary>
+    private readonly Dictionary<string, int[]> _columnOrders = new(StringComparer.OrdinalIgnoreCase);
+
     public IReadOnlyList<string> SheetNames { get; private set; } = Array.Empty<string>();
 
     public void Open(string path)
@@ -30,8 +35,13 @@ public sealed class WorkbookModel : IDisposable
         Path = path;
         _cache.Clear();
         using var doc = SpreadsheetDocument.Open(path, false);
-        var wb = doc.WorkbookPart!.Workbook;
-        SheetNames = (wb.Sheets?.Elements<Sheet>().Select(s => s.Name!.Value!).ToList() ?? new List<string>());
+        var wbPart = doc.WorkbookPart!;
+        var wb = wbPart.Workbook;
+        // 内部配置表“__GameCurve__”不出现在用户可见的工作表列表中
+        SheetNames = (wb.Sheets?.Elements<Sheet>()
+            .Where(s => !string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase))
+            .Select(s => s.Name!.Value!).ToList() ?? new List<string>());
+        LoadColumnOrders(wbPart);
         LastModified = File.GetLastWriteTimeUtc(path);
     }
 
@@ -40,6 +50,118 @@ public sealed class WorkbookModel : IDisposable
     {
         LastModified = File.GetLastWriteTimeUtc(Path);
         _cache.Clear();
+    }
+
+    /// <summary>从内部配置表读入各工作表列顺序。</summary>
+    private void LoadColumnOrders(WorkbookPart wbPart)
+    {
+        _columnOrders.Clear();
+        var sheet = wbPart.Workbook.Sheets?.Elements<Sheet>()
+            .FirstOrDefault(s => string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase));
+        if (sheet == null) return;
+        var wsPart = (WorksheetPart)wbPart.GetPartById(sheet.Id!);
+        var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
+        if (sheetData == null) return;
+        CellHelper.SetSharedStrings(wbPart.SharedStringTablePart?.SharedStringTable);
+        foreach (var row in sheetData.Elements<Row>())
+        {
+            var cells = row.Elements<Cell>().ToList();
+            if (cells.Count < 2) continue;
+            var name = CellHelper.GetCellValue(cells[0]);
+            var text = CellHelper.GetCellValue(cells[1]);
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(text)) continue;
+            var order = ParseColumnOrder(text);
+            if (order != null && order.Length > 0) _columnOrders[name] = order;
+        }
+    }
+
+    private static int[]? ParseColumnOrder(string text)
+    {
+        var parts = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var list = new List<int>();
+        foreach (var p in parts)
+            if (int.TryParse(p, out var v) && v >= 0) list.Add(v);
+        return list.Count > 0 ? list.Distinct().ToArray() : null;
+    }
+
+    /// <summary>返回某工作表的列显示顺序（物理列索引数组）；未记录时返回 null。</summary>
+    public IReadOnlyList<int>? GetColumnOrder(string sheetName)
+        => _columnOrders.TryGetValue(sheetName, out var o) ? o : null;
+
+    /// <summary>把某工作表的列显示顺序写入内部配置表（非常隐藏），随文件持久化。</summary>
+    public bool TryWriteColumnOrder(string sheetName, IReadOnlyList<int> order, out string? error)
+    {
+        error = null;
+        if (order == null || order.Count == 0) return true;
+        try
+        {
+            _columnOrders[sheetName] = order.Distinct().ToArray();
+            using var doc = SpreadsheetDocument.Open(Path, true);
+            var wbPart = doc.WorkbookPart!;
+            var wsPart = GetOrCreateOrderSheet(wbPart);
+            var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>();
+            if (sheetData == null)
+            {
+                sheetData = new SheetData();
+                wsPart.Worksheet.AppendChild(sheetData);
+            }
+            // 每次全量重写，确保多个工作表的顺序都被保留且不重复
+            sheetData.RemoveAllChildren();
+            int rowNum = 1;
+            foreach (var kv in _columnOrders)
+            {
+                var row = new Row { RowIndex = (uint)rowNum };
+                row.Append(
+                    MakeInlineCell("A" + rowNum, kv.Key),
+                    MakeInlineCell("B" + rowNum, string.Join(",", kv.Value)));
+                sheetData.AppendChild(row);
+                rowNum++;
+            }
+            wsPart.Worksheet.Save();
+            doc.Save();
+            LastModified = File.GetLastWriteTimeUtc(Path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            error = "文件被占用，无法保存列顺序。请关闭 Excel 后重试。" + ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = "保存列顺序失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    private static Cell MakeInlineCell(string cellRef, string text) => new()
+    {
+        CellReference = cellRef,
+        DataType = CellValues.InlineString,
+        InlineString = new InlineString(new Text(text))
+    };
+
+    private static WorksheetPart GetOrCreateOrderSheet(WorkbookPart wbPart)
+    {
+        var sheet = wbPart.Workbook.Sheets?.Elements<Sheet>()
+            .FirstOrDefault(s => string.Equals(s.Name?.Value, OrderSheetName, StringComparison.OrdinalIgnoreCase));
+        if (sheet != null) return (WorksheetPart)wbPart.GetPartById(sheet.Id!);
+
+        var wsPart = wbPart.AddNewPart<WorksheetPart>();
+        if (wsPart.Worksheet == null) wsPart.Worksheet = new Worksheet();
+        var sheets = wbPart.Workbook.GetFirstChild<Sheets>();
+        uint sheetId = 1;
+        if (sheets != null && sheets.Elements<Sheet>().Any())
+            sheetId = (uint)(sheets.Elements<Sheet>().Max(s => s.SheetId?.Value ?? 0) + 1);
+        sheets ??= wbPart.Workbook.AppendChild(new Sheets());
+        sheets.AppendChild(new Sheet
+        {
+            Name = OrderSheetName,
+            SheetId = sheetId,
+            Id = wbPart.GetIdOfPart(wsPart),
+            State = SheetStateValues.VeryHidden
+        });
+        return wsPart;
     }
 
     /// <summary>加载某工作表并生成列元信息与网格快照。</summary>

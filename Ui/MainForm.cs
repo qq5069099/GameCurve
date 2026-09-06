@@ -21,6 +21,8 @@ public sealed class MainForm : Form
     private readonly HashSet<int> _pendingHeaderAlign = new();
     private readonly HashSet<int> _pendingColumnAlign = new();
     private bool _structureQueued;
+    private bool _columnOrderDirty;
+    private bool _suppressColumnOrderDirty;
     private TextBox? _headerEdit;
     private int _headerEditPhysicalCol = -1;   // -1 表示没有在编辑列名
 
@@ -405,6 +407,7 @@ public sealed class MainForm : Form
         _grid.AllowUserToResizeRows = true;
         _grid.AllowUserToResizeColumns = true;
         _grid.AllowUserToOrderColumns = true;           // 列名按住拖拽移动顺序
+        _grid.ColumnDisplayIndexChanged += (s, e) => { if (!_suppressColumnOrderDirty) _columnOrderDirty = true; };
         _grid.RowHeadersVisible = true;
         _grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;  // 点击只选中，键入/F2/双击进入编辑（Excel 式）
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
@@ -584,6 +587,7 @@ public sealed class MainForm : Form
             return;
         }
         _snapshot = d.Snapshot;
+        _columnOrderDirty = false;
         var curveOptions = d.CurveOptions;
         _autoFocusCol = -1;
         _colsChecked.Items.Clear();
@@ -716,7 +720,7 @@ public sealed class MainForm : Form
         StartSheetLoad(name);
     }
 
-    private bool HasUnsavedChanges() => _dirtyCells.Count > 0 || _structureQueued || _pendingHeaderRename.Count > 0 || _pendingHeaderAlign.Count > 0 || _pendingColumnAlign.Count > 0;
+    private bool HasUnsavedChanges() => _dirtyCells.Count > 0 || _structureQueued || _pendingHeaderRename.Count > 0 || _pendingHeaderAlign.Count > 0 || _pendingColumnAlign.Count > 0 || _columnOrderDirty;
 
     private void DiscardUnsaved()
     {
@@ -727,6 +731,8 @@ public sealed class MainForm : Form
         _pendingHeaderAlign.Clear();
         _pendingColumnAlign.Clear();
         _structureQueued = false;
+        _columnOrderDirty = false;
+        ApplySavedColumnOrder();
         _pendingUndoRows.Clear();
         _subEditOldText.Clear();
         _editing.Clear();
@@ -980,7 +986,7 @@ public sealed class MainForm : Form
     {
         if (_wb == null) return;
         bool hasStructure = _pendingStructure.Count > 0;
-        if (_dirtyCells.Count == 0 && !hasStructure && _pendingHeaderRename.Count == 0 && _pendingHeaderAlign.Count == 0 && _pendingColumnAlign.Count == 0) return;
+        if (_dirtyCells.Count == 0 && !hasStructure && _pendingHeaderRename.Count == 0 && _pendingHeaderAlign.Count == 0 && _pendingColumnAlign.Count == 0 && !_columnOrderDirty) return;
         _autoSaveTimer.Stop();
         var sheet = _snapshot?.SheetName ?? _activeSheet;
 
@@ -1057,18 +1063,79 @@ public sealed class MainForm : Form
             if (okColAlign) _pendingColumnAlign.Clear();
         }
 
+        // 6) 列显示顺序写回（用户按住表头拖拽移动列后的顺序，随文件持久化）
+        bool okOrder = true;
+        string? errOrder = null;
+        bool orderChanged = _columnOrderDirty;
+        if (orderChanged && _snapshot != null)
+        {
+            var order = BuildCurrentColumnOrder();
+            _selfWrite = true;
+            okOrder = _wb.TryWriteColumnOrder(_snapshot.SheetName, order, out errOrder);
+            _selfWrite = false;
+            if (okOrder) _columnOrderDirty = false;
+        }
+
         if (!ok) _statusLabel.Text = "⚠ " + errNum;
         else if (!okStr) _statusLabel.Text = "⚠ " + errStr;
         else if (!okHeader) _statusLabel.Text = "⚠ " + errHeader;
         else if (!okColAlign) _statusLabel.Text = "⚠ " + errColAlign;
+        else if (!okOrder) _statusLabel.Text = "⚠ " + errOrder;
         else
         {
-            _statusLabel.Text = $"已保存 {nums.Count + strs.Count} 个单元格";
+            int cellCount = nums.Count + strs.Count;
+            _statusLabel.Text = orderChanged
+                ? (cellCount > 0 ? $"已保存 {cellCount} 个单元格并保存列顺序" : "已保存列顺序")
+                : $"已保存 {cellCount} 个单元格";
             _structureQueued = false;
             _pendingHeaderRename.Clear();
             _dirtyCells.Clear();
         }
         UpdateTitle();
+    }
+
+    /// <summary>按当前 DataGridView 的显示顺序返回物理列索引序列（用于持久化）。</summary>
+    private List<int> BuildCurrentColumnOrder()
+    {
+        var result = new List<int>();
+        if (_grid == null) return result;
+        foreach (var col in _grid.Columns.Cast<DataGridViewColumn>().OrderBy(c => c.DisplayIndex))
+        {
+            if (col.Name == "行号") continue;
+            int physical = col.Index - 1;
+            if (physical >= 0) result.Add(physical);
+        }
+        return result;
+    }
+
+    /// <summary>把保存的列显示顺序应用到当前表格（行号列固定在最前）。</summary>
+    private void ApplySavedColumnOrder()
+    {
+        if (_wb == null || _snapshot == null) return;
+        var order = _wb.GetColumnOrder(_snapshot.SheetName);
+        if (order == null || order.Count == 0) return;
+        _suppressColumnOrderDirty = true;
+        try
+        {
+            var wanted = new List<int>();
+            var used = new HashSet<int>();
+            foreach (int physical in order)
+            {
+                int gridIndex = physical + 1;
+                if (gridIndex <= 0 || gridIndex >= _grid.Columns.Count) continue;
+                if (!used.Add(gridIndex)) continue;
+                wanted.Add(gridIndex);
+            }
+            // 补上未出现在顺序里的列，保持它们默认的相对顺序
+            for (int g = 1; g < _grid.Columns.Count; g++)
+                if (!used.Contains(g)) wanted.Add(g);
+            for (int i = 0; i < wanted.Count; i++)
+                _grid.Columns[wanted[i]].DisplayIndex = i + 1;
+        }
+        finally
+        {
+            _suppressColumnOrderDirty = false;
+        }
     }
 
     private string CellText(int col, int row)
@@ -1105,8 +1172,9 @@ public sealed class MainForm : Form
     private void BuildGrid()
     {
         CancelHeaderEdit();
+        _suppressColumnOrderDirty = true;
         _grid.Columns.Clear();
-        if (_snapshot == null) { _grid.Rows.Clear(); return; }
+        if (_snapshot == null) { _grid.Rows.Clear(); _suppressColumnOrderDirty = false; return; }
         var header = new DataGridViewTextBoxColumn
         {
             HeaderText = "行号",
@@ -1162,6 +1230,8 @@ public sealed class MainForm : Form
             _grid.Rows.Add(cells);
         }
         _grid.ClearSelection();
+        ApplySavedColumnOrder();
+        _suppressColumnOrderDirty = false;
     }
 
     private void UpdateGridCells(IReadOnlyList<int> rows)

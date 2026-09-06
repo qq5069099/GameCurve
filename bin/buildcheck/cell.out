@@ -1,0 +1,7 @@
+测试文件: C:\Users\50690\Desktop\github\GameCurve\test\excel\ShopSystem@商城系统.xlsm
+工作表: ShopSystem | Shop | ShopGift
+[Shop] 数值列 'ID:序号' 类型= 整数=True 点数=79
+  样例: 2:1, 3:2, 4:3, 5:4, 6:5, 7:6
+写回 Shop!A2: 1 -> 2.25  err=无
+重读 A2 = 2  -> OK
+宏保留: 是
