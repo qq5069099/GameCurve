@@ -25,8 +25,9 @@ public sealed class MainForm : Form
     private int _headerEditPhysicalCol = -1;   // -1 表示没有在编辑列名
 
     private readonly ToolStrip _tool = new();
-    private readonly ToolStripButton _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
+    private readonly ToolStripMenuItem _autoSaveCheck = new("自动保存") { Checked = false, CheckOnClick = true };
     private readonly ToolStripDropDownButton _openMenu = new("打开");
+    private readonly ToolStripDropDownButton _saveMenu = new("保存");
     private readonly ToolStripDropDownButton _gridButton = new("表格");
     private readonly ToolStripDropDownButton _layoutButton = new("布局");
     private ToolStripMenuItem _gridMaxItem = null!;
@@ -200,15 +201,17 @@ public sealed class MainForm : Form
         _tool.GripStyle = ToolStripGripStyle.Hidden;
         _openMenu.DropDownOpening += (s, e) => RebuildOpenMenu();
         _tool.Items.Add(_openMenu);
-        AddButton("保存", "把当前改动写回 Excel 文件（Ctrl+S）", OnSave);
-        AddButton("另存为", "复制一份并另存为新文件", OnSaveAs);
+        // “保存”主菜单统一放置：保存、另存为、自动保存
+        _saveMenu.DropDownItems.Add(MakeMenu("保存", "把当前改动写回 Excel 文件（Ctrl+S）", OnSave, false));
+        _saveMenu.DropDownItems.Add(MakeMenu("另存为", "复制一份并另存为新文件", OnSaveAs, false));
+        _saveMenu.DropDownItems.Add(_autoSaveCheck);
+        _tool.Items.Add(_saveMenu);
         AddButton("刷新", "重新从磁盘读取当前工作表", OnReload);
         _tool.Items.Add(new ToolStripSeparator());
         AddButton("撤销", "撤销上次编辑（Ctrl+Z）", () => Undo());
         AddButton("重做", "重做上次撤销（Ctrl+Y）", () => Redo());
         _tool.Items.Add(new ToolStripSeparator());
         AddButton("导出PNG", "把当前曲线图导出为 PNG 图片", OnExport);
-        _tool.Items.Add(_autoSaveCheck);
         _gridButton.DropDownOpening += (s, e) => BuildGridToolbarMenu();
         _tool.Items.Add(_gridButton);
         // “布局”菜单统一放置表格的布局切换：最大化/还原、置底/靠右
