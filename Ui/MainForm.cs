@@ -597,7 +597,7 @@ public sealed class MainForm : Form
             string hint = prep.ShowOccupiedHint
                 ? "\n\n该文件当前可能被其他程序（如 Excel）占用，请关闭后重试。"
                 : "";
-            MessageBox.Show(this, "无法打开文件：\n" + prep.Error + hint, "错误",
+            MessageBox.Show("无法打开文件：\n" + prep.Error + hint, "错误",
                 MessageBoxButtons.OK, MessageBoxIcon.Error,
                 MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
             return;
@@ -702,6 +702,26 @@ public sealed class MainForm : Form
         catch (Exception ex)
         {
             MessageBox.Show(this, "无法用 Excel 打开当前文件：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>在资源管理器中打开当前工作簿所在的文件夹。</summary>
+    private void OpenCurrentFileFolder()
+    {
+        if (_wb == null) return;
+        string? folder = Path.GetDirectoryName(_wb.Path);
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+        {
+            MessageBox.Show(this, "当前文件所在的文件夹不存在。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", folder) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "无法打开文件夹：\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -3827,10 +3847,20 @@ public sealed class MainForm : Form
         close.Click += (s, e) => CloseCurrentFile();
         _openMenu.DropDownItems.Add(close);
 
+        _openMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        // “打开与定位”小组：用 Excel 打开当前文件 / 打开文件所在的文件夹
         var openExcel = new ToolStripMenuItem("用Excel打开当前文件");
         openExcel.Enabled = _wb != null && File.Exists(_wb.Path);
         openExcel.Click += (s, e) => OpenCurrentInExcel();
         _openMenu.DropDownItems.Add(openExcel);
+
+        var openFolder = new ToolStripMenuItem("打开文件所在的文件夹");
+        openFolder.Enabled = _wb != null &&
+            !string.IsNullOrWhiteSpace(Path.GetDirectoryName(_wb.Path)) &&
+            Directory.Exists(Path.GetDirectoryName(_wb.Path));
+        openFolder.Click += (s, e) => OpenCurrentFileFolder();
+        _openMenu.DropDownItems.Add(openFolder);
 
         _openMenu.DropDownItems.Add(new ToolStripSeparator());
 
