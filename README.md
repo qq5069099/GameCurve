@@ -1,14 +1,79 @@
 # GameCurve - 游戏数据曲线编辑器
 
-面向游戏策划和配置人员的 Excel 曲线编辑工具。打开 `.xlsx / .xlsm` 工作簿后，选择一个或多个曲线子列，将其可视化为曲线；支持拖动点、框选、多选、Shift 范围选择、键盘微调，并把修改写回 Excel 对应单元格。反向亦然：在下方表格中手工编辑单元格，曲线也会同步更新。
+面向游戏策划和配置人员的 Excel 曲线编辑工具。打开 `.xlsx / .xlsm` 工作簿后，勾选一个或多个曲线子列，将其可视化为曲线；支持拖动点、框选、多选、`Shift` 范围选择、键盘微调，并把修改写回 Excel 对应单元格。反向亦然：在下方表格中手工编辑单元格，曲线也会同步更新。
 
-表格区采用 Excel 式编辑体验：单击列名选中整列、单击行头选中整行、按住行头上下拖动可多选整行，右键菜单可直接删除选中的多行；单元格点击只选中，键入或 `F2`/双击进入编辑。
+表格区采用 Excel 式编辑体验：单击列名选中整列、单击行头选中整行、按住行头上下拖动可多选整行，右键菜单可直接删除选中的多行；单元格点击只选中，键入或 `F2` / 双击进入编辑。
+
+## 项目结构
+
+解决方案为单个 `.NET 9` Windows Forms 项目，按职责划分为 `Excel`（OpenXml 数据层）、`Models`（数据模型）、`Services`（核心逻辑）、`Ui`（界面）四层。
+
+```text
+GameCurve/
+├─ GameCurve.sln                    # 解决方案文件
+├─ GameCurve.csproj                 # 项目配置：net9.0-windows / WinForms / OpenXml
+├─ GameCurve.csproj.user            # 用户级项目配置
+├─ Program.cs                       # 程序入口：--test 自测 / 启动主窗体
+├─ TestHarness.cs                   # 无界面自测：验证读取、列识别、曲线点、回写等
+├─ .gitignore                       # 忽略 .vs / .vscode / obj
+│
+├─ Excel/                           # OpenXml 读取与回写层
+│  ├─ WorkbookModel.cs              # 工作簿入口：枚举表、加载快照、列/表顺序、批量写回
+│  ├─ SheetStructure.cs             # 行列“平移式”结构编辑：插入/删除行、插入/删除列
+│  ├─ HeaderParser.cs               # 解析表头：字段名 / 类型 / 显示名 / 数值列判定
+│  └─ CellHelper.cs                 # 单元格读写辅助：共享字符串、数值解析、引用换算
+│
+├─ Models/                          # 数据模型
+│  ├─ ColumnMeta.cs                 # 单列元信息：列索引、字母、名称、类型、数值性
+│  ├─ CurveColumnOption.cs          # “子曲线”来源：整列 / 数组元素 / JSON v
+│  ├─ CurveData.cs                  # CurvePoint 数据点与 CurveSeries 曲线序列
+│  └─ SheetSnapshot.cs              # 工作表快照：网格文本、列元信息、行列对齐
+│
+├─ Services/                        # 核心逻辑
+│  ├─ CurveFit.cs                   # 最小二乘拟合：线性/多项式/指数/对数/幂/S型/高斯/正弦/有理
+│  ├─ CurveMath.cs                  # Catmull-Rom 样条、移动平滑、归一化、钳制
+│  ├─ Statistics.cs                 # 数值统计：数量/最小/最大/平均/中位/总和/标准差
+│  └─ SubCurveHelper.cs             # 子曲线拆分与回写：数组列 / .range / .json
+│
+├─ Ui/                              # WinForms 界面
+│  ├─ MainForm.cs                   # 主窗体：布局、曲线列选择、表格编辑、批量/撤销/保存
+│  ├─ MainForm.resx                 # 主窗体资源
+│  ├─ CurveEditor.cs                # 自定义曲线控件：网格、多曲线、拖点/框选/缩放平移
+│  ├─ FitDialog.cs                  # 高级拟合对话框：参数固定/正则化/混合/锚点
+│  └─ SplashForm.cs                 # 加载画面：标题 + 跑马灯进度条
+│
+├─ Properties/                      # 发布配置
+│  └─ PublishProfiles/
+│     ├─ FolderProfile.pubxml       # win-x64 文件夹发布档案
+│     └─ FolderProfile.pubxml.user
+│
+├─ test/excel/                      # 测试样例工作簿（.xlsm 带宏）
+│  ├─ Base@全局数据.xlsm
+│  ├─ BuffSystem@Buff系统.xlsm
+│  ├─ GameSystem@游戏系统.xlsm
+│  ├─ GuideSystem@引导系统.xlsm
+│  ├─ ShopSystem@商城系统.xlsm
+│  └─ TaskSystem@任务系统.xlsm
+│
+├─ bin/                             # 构建产物（含多种配置/运行时目录）
+├─ obj/                             # 构建中间产物（已忽略）
+└─ publish/                         # 自包含发布目录（可直接运行的 GameCurve.exe）
+```
+
+**依赖**：`DocumentFormat.OpenXml 3.1.1`，用于读取与写回 `.xlsx / .xlsm`，写回时仅修改目标单元格，保留原工作簿格式、公式、共享字符串与宏（`vbaProject.bin`）。
+
+## 技术栈
+
+- 语言与运行时：C# / .NET 9（`net9.0-windows`）
+- UI：Windows Forms（`UseWindowsForms=true`）
+- 配置文件处理：DocumentFormat.OpenXml 3.1.1
+- 发布形态：`win-x64`，支持自包含单文件打包，无需目标机器安装 .NET
 
 ## 运行
 
 已发布自包含程序，无需安装 .NET：
 
-```
+```powershell
 publish\GameCurve.exe [工作簿路径]
 ```
 
@@ -18,9 +83,38 @@ publish\GameCurve.exe [工作簿路径]
 
 需要 .NET 9 SDK 和 Windows 桌面运行时：
 
-```
+```powershell
 dotnet build -c Release
 dotnet publish GameCurve.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+```
+
+若使用 `Properties/PublishProfiles/FolderProfile.pubxml`，也可在 Visual Studio 中直接发布到 `bin\Release\net9.0-windows\publish\win-x64\`。
+
+## 无界面自测
+
+程序内置 `--test` 自测模式，无需打开界面即可验证读取、列识别、结构编辑与回写，常用于发布前回归：
+
+```powershell
+GameCurve.exe --test [工作簿路径]
+```
+
+指定第二个参数可切换测试文件，默认使用 `test/excel/` 下的样例。子命令：
+
+| 子命令 | 用途 |
+| --- | --- |
+| `--render` | 渲染第一条数值列为 PNG（`--render <文件> <输出.png>`） |
+| `--structure` | 验证行列插入 / 删除、内存快照操作与宏保留 |
+| `--subcurve` | 验证子曲线列空白格不写回、有值格可读改写 |
+| `--columnorder` | 验证列显示顺序的持久化 |
+| `--columnwidth` | 验证列宽读写 |
+| `--sheetorder` | 验证工作表显示顺序的持久化 |
+| `--addsheet` | 验证新建工作表 |
+| `--renamesheet` | 验证工作表重命名 |
+
+例如：
+
+```powershell
+publish\GameCurve.exe --test --render test\excel\Base@全局数据.xlsm temp.png
 ```
 
 ## 支持的曲线数据
