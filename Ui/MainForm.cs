@@ -450,7 +450,10 @@ public sealed class MainForm : Form
             if (_suppressRebuild) return;
             _preferredListIndex = e.Index;
             _preferredListChecked = e.NewValue == CheckState.Checked;
-            BeginInvoke((Action)OnSelectionChanged);
+            // 勾选集合变化只影响“曲线序列”：不重建整个网格、
+            // 不清空撤销历史、不滚动列表，否则重绘错位会让用户误以为
+            // 别项也被取消了（点击两次时尤其明显）。
+            BeginInvokeSafe(ApplyCheckedColumns);
         };
         _colsChecked.MouseMove += OnColumnListMouseMove;
         _xCombo.SelectedIndexChanged += (s, e) => OnSelectionChangedSafe();
@@ -1246,6 +1249,90 @@ public sealed class MainForm : Form
             UpdateStats();
             UpdateTitle();
             _curve.ClearSelection();
+        }
+        finally
+        {
+            _preferredListIndex = -1;
+            _preferredListChecked = false;
+            _suppressRebuild = false;
+        }
+    }
+
+    /// <summary>
+    /// 勾选“曲线列 (Y) 多选”后的轻量刷新：只按最新勾选集合重建曲线序列并同步高亮，
+    /// 不重建数据网格、不清空撤销历史、不滚动列表。
+    /// 解决“点一项取消勾选时感觉别项也被取消 / 列表卡顿”的问题。
+    /// </summary>
+    private void ApplyCheckedColumns()
+    {
+        if (_suppressRebuild || _wb == null || _snapshot == null) return;
+        CommitPending();
+
+        _suppressRebuild = true;
+        try
+        {
+            var preserved = _activeYColumn;
+            _checkedCols = _colsChecked.CheckedItems.Cast<CurveColumnOption>().ToList();
+
+            if (_checkedCols.Count == 0)
+            {
+                _series.Clear();
+                _curve.SetSeries(new List<CurveSeriesView>(), -1);
+                _activeYColumn = null;
+                _committed.Clear();
+                _editing.Clear();
+                _curve.XAxisLabel = "行号";
+                _curve.YAxisLabel = "";
+                HighlightEditableColumn();
+                UpdateStats();
+                UpdateTitle();
+                return;
+            }
+
+            _xColumn = _xCombo.SelectedIndex > 0 ? _xCombo.SelectedItem as CurveColumnOption : null;
+            int activeIndex = 0;
+            if (_preferredListIndex >= 0 && _preferredListChecked &&
+                _preferredListIndex < _colsChecked.Items.Count &&
+                _colsChecked.Items[_preferredListIndex] is CurveColumnOption preferred)
+            {
+                int pi = _checkedCols.FindIndex(o => ReferenceEquals(o, preferred));
+                if (pi >= 0) activeIndex = pi;
+            }
+            else if (preserved != null)
+            {
+                int pi = _checkedCols.FindIndex(o => IsSameCurveOption(o, preserved));
+                if (pi >= 0) activeIndex = pi;
+            }
+            _activeYColumn = _checkedCols[activeIndex];
+
+            bool activeChanged = preserved == null ||
+                                 !IsSameCurveOption(_checkedCols[activeIndex], preserved);
+
+            _series.Clear();
+            for (int i = 0; i < _checkedCols.Count; i++)
+                _series.Add(BuildSeriesForOption(_checkedCols[i], i == activeIndex));
+
+            _curve.SetSeries(_series, activeIndex);
+            _curve.XAxisLabel = _xColumn != null ? _xColumn.DisplayName : "行号";
+            _curve.YAxisLabel = _activeYColumn.DisplayName;
+            SyncActiveColumnHighlight(activeIndex);
+            HighlightEditableColumn();
+
+            // 仅当当前编辑列发生变化时才重设提交/编辑基线；撤销历史保留。
+            if (activeChanged)
+            {
+                _committed.Clear();
+                _editing.Clear();
+                _pendingUndoRows.Clear();
+                _subEditOldText.Clear();
+                foreach (var p in _curve.Points)
+                {
+                    _committed[p.RowNumber] = (p.X, p.Y);
+                    _editing[p.RowNumber] = (p.X, p.Y);
+                }
+            }
+            UpdateStats();
+            UpdateTitle();
         }
         finally
         {
