@@ -466,6 +466,7 @@ public sealed class MainForm : Form
         _fitTypeCombo.SelectedIndexChanged += (s, e) => _fitDegree.Enabled = SelectedFitModel() == FitModel.Polynomial;
 
         _curve.PointsChanged += OnPointsChanged;
+        _curve.PointsRemoved += OnPointsRemoved;
         _curve.EditCommitted += OnEditCommitted;
         _curve.SelectionChanged += OnSelectionChangedUi;
         _curve.HoverChanged += s => _hoverLabel.Text = s;
@@ -1497,6 +1498,48 @@ public sealed class MainForm : Form
         UpdateGridCells(rows);
         UpdateStats();
         UpdateTitle();
+    }
+
+    /// <summary>
+    /// 曲线选中点被删除：只把 Y 列中与该曲线对应的数据节点（或标量值）删除，
+    /// 不会清空整格 JSON 数组，也不会影响同列其它子曲线数据点。
+    /// </summary>
+    private void OnPointsRemoved(IReadOnlyList<int> rows)
+    {
+        if (rows.Count == 0 || _activeYColumn == null || _snapshot == null) return;
+        int yCol = _activeYColumn.Column.ColumnIndex;
+        var undoItems = new List<(int Col, int Row, string Old, string New)>();
+
+        foreach (var row in rows)
+        {
+            string oldY = CellText(yCol, row);
+            string newY = _activeYColumn.IsSubCurve
+                ? SubCurveHelper.RemoveValue(oldY, _activeYColumn)
+                : "";
+
+            if (!string.IsNullOrWhiteSpace(oldY) && !string.Equals(oldY, newY, StringComparison.Ordinal))
+            {
+                UpdateSnapshotCell(row, yCol, newY);
+                _dirtyCells.Add((yCol, row));
+                undoItems.Add((yCol, row, oldY, newY));
+            }
+
+            _editing.Remove(row);
+            _committed.Remove(row);
+            if (_rowToGridIndex.TryGetValue(row, out var gi) && gi >= 0 && gi < _grid.Rows.Count)
+                _grid.Rows[gi].Cells[yCol + 1].Value = newY;
+        }
+
+        if (undoItems.Count > 0)
+        {
+            _undo.Add(new EditCmd(undoItems));
+            _redo.Clear();
+        }
+        _pendingUndoRows.Clear();
+        _curve.Invalidate();
+        UpdateStats();
+        UpdateTitle();
+        CommitPending();
     }
 
     private void OnEditCommitted()

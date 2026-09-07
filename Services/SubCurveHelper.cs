@@ -296,6 +296,66 @@ public static class SubCurveHelper
         catch { return raw; }
     }
 
+    /// <summary>
+    /// 删除子曲线对应的数据节点并重新生成整格文本：.json 数组只删除与当前曲线对应的那个对象节点，
+    /// 数组标量列删除对应下标元素，单个 .json 对象（该曲线独占整格）则清空整格。
+    /// 任何情况下都不会清空整格 JSON 数组内容。
+    /// </summary>
+    public static string RemoveValue(string raw, CurveColumnOption opt)
+    {
+        if (opt.SubIndex >= 0)
+            return RemoveArrayElement(raw, opt.SubIndex);
+
+        try
+        {
+            var node = JsonNode.Parse(raw);
+            if (node == null) return raw;
+            if (node is JsonArray arr)
+            {
+                JsonNode? target = null;
+                if (opt.JsonId.Length > 0)
+                {
+                    foreach (var el in arr)
+                        if (el is JsonObject obj &&
+                            obj["ID"] is JsonValue idv &&
+                            IdMatches(idv, opt.JsonId))
+                        { target = el; break; }
+                }
+                else if (opt.JsonIndex >= 0 && opt.JsonIndex < arr.Count)
+                    target = arr[opt.JsonIndex];
+
+                if (target == null) return raw;
+                arr.Remove(target);
+                return SerializeNode(node);
+            }
+            if (node is JsonObject)
+                return ""; // 单对象独占整格，删除该点即清空整格
+            return raw;
+        }
+        catch { return raw; }
+    }
+
+    private static bool IdMatches(JsonValue idv, string jsonId)
+    {
+        try { return idv.GetValue<double>().ToString(CultureInfo.InvariantCulture) == jsonId; }
+        catch { return false; }
+    }
+
+    private static string RemoveArrayElement(string raw, int index)
+    {
+        var parts = SplitArray(raw).ToList();
+        if (index < 0 || index >= parts.Count) return raw;
+        parts.RemoveAt(index);
+        return "[" + string.Join(",", parts) + "]";
+    }
+
+    private static string SerializeNode(JsonNode node)
+        => node.ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = false,
+            NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.Strict
+        });
+
     private static string SetArrayValue(string raw, int index, double y)
     {
         var parts = SplitArray(raw).ToList();

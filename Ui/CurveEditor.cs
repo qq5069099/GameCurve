@@ -45,6 +45,8 @@ public sealed class CurveEditor : Control
     public List<(double X, double Y)>? OverlayPoints { get; set; }
 
     public event Action<IReadOnlyList<int>>? PointsChanged;
+    /// <summary>点被删除后触发，参数为被删除点对应的物理行号（已按升序去重）。</summary>
+    public event Action<IReadOnlyList<int>>? PointsRemoved;
     public event Action? EditCommitted;
     public event Action? SelectionChanged;
     public event Action<string>? HoverChanged;
@@ -179,6 +181,24 @@ public sealed class CurveEditor : Control
                 Invalidate();
                 return;
             }
+    }
+
+    /// <summary>删除当前编辑列上所有选中的点，并把被删点对应的物理行号通过 <see cref="PointsRemoved"/> 通知外部。</summary>
+    public void DeleteSelectedPoints()
+    {
+        var list = ActiveSeries?.Points;
+        if (list == null || _selected.Count == 0) return;
+        var rows = _selected.OrderBy(i => i).Select(i => list[i].RowNumber)
+            .Where(r => r != 0).Distinct().ToList();
+        // 自后往前删除，避免删除过程中索引位移
+        foreach (var idx in _selected.OrderByDescending(i => i))
+            list.RemoveAt(idx);
+        _selected.Clear();
+        _selectAnchor = -1;
+        Invalidate();
+        SelectionChanged?.Invoke();
+        if (rows.Count > 0)
+            PointsRemoved?.Invoke(rows);
     }
 
     public void ApplyToSelected(Func<CurvePoint, (double X, double Y)> transform, bool commit = true)
@@ -836,6 +856,12 @@ public sealed class CurveEditor : Control
         if (e.Control && e.KeyCode == Keys.A)
         {
             SelectAll();
+            e.Handled = true;
+            return;
+        }
+        if (e.KeyCode == Keys.Delete && _selected.Count > 0)
+        {
+            DeleteSelectedPoints();
             e.Handled = true;
             return;
         }
